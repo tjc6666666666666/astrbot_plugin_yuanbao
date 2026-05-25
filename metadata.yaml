@@ -1,5 +1,5 @@
-name: yuanbao
-desc: 元宝龙虾适配器
+name: astrbot_plugin_yuanbao
+desc: 腾讯元宝派 机器人的适配插件
 version: v1.0.2
 author: tjc6666666666666
-repo: https://github.com/tjc6666666666666/astrbot_plugn_yuanbao
+repo: https://github.com/tjc6666666666666/astrbot_plugin_yuanbao
