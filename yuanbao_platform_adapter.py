@@ -35,6 +35,11 @@ from astrbot.api.platform import (
 )
 from astrbot.api.event import MessageChain
 from astrbot.api.message_components import Plain, Image, File, Record, Video
+
+try:
+    from astrbot.api.message_components import At
+except ImportError:
+    At = None
 from astrbot.core.platform.astr_message_event import MessageSesion
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 from astrbot.api import logger
@@ -45,6 +50,7 @@ from .yuanbao_codec import (
     parse_push_content_to_msg_body,
     extract_text_from_msg_body,
     extract_media_from_msg_body,
+    extract_mentions_from_msg_body,
 )
 from .yuanbao_platform_event import YuanbaoPlatformEvent
 from . import yuanbao_codec as codec
@@ -310,12 +316,15 @@ class YuanbaoPlatformAdapter(Platform):
             logger.debug("[yuanbao] 无法解析消息体, 跳过")
             return None
 
-        # Build AstrBotMessage
-        abm = AstrBotMessage()
-
         # Determine chat type
         group_code = extra.get("group_code") or extra.get("groupCode") or ""
         is_group = bool(group_code) or push.get("cmd", "").startswith("Group.")
+
+        # Extract @mentions (for At components — AstrBot's WakingCheckStage handles wake)
+        mentions = extract_mentions_from_msg_body(msg_body)
+
+        # Build AstrBotMessage
+        abm = AstrBotMessage()
 
         if is_group:
             abm.type = MessageType.GROUP_MESSAGE
@@ -331,6 +340,18 @@ class YuanbaoPlatformAdapter(Platform):
         # Message content — extract text + media
         abm.message_str = extract_text_from_msg_body(msg_body)
         abm.message = [Plain(text=abm.message_str)]
+
+        # Add At components for @mentions (so AstrBot's WakingCheckStage detects them)
+        if At is not None and mentions:
+            at_components = []
+            for m in mentions:
+                uid = m["user_id"]
+                text = m.get("text", "")
+                # text format is "@Nickname" — strip the "@" for the name field
+                name = text.lstrip("@") if text.startswith("@") else text
+                at_components.append(At(qq=uid, name=name))
+            # Insert At components at the front of the chain (before Plain)
+            abm.message = at_components + abm.message
 
         # Extract media elements from msg_body and populate Image/File/Record/Video components
         media_items = extract_media_from_msg_body(msg_body)

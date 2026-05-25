@@ -477,14 +477,72 @@ def sanitize_msg_body_elements(elements: list[dict]) -> list[dict]:
 
 
 def extract_text_from_msg_body(msg_body: list[dict]) -> str:
-    """Extract plain text from msg_body elements."""
+    """Extract plain text from msg_body elements.
+
+    Skips TIMCustomElem @mention elements (elem_type=1002) — those are
+    handled separately by extract_mentions_from_msg_body().
+    """
     parts = []
     for el in msg_body or []:
+        msg_type = el.get("msg_type", "")
         mc = el.get("msg_content", {})
+        # Skip custom @mention elements — they are processed as At components
+        if msg_type == "TIMCustomElem":
+            data_str = mc.get("data", "")
+            if isinstance(data_str, str):
+                try:
+                    custom = json.loads(data_str)
+                    if custom.get("elem_type") == 1002:
+                        # Don't include @text in the plain text extraction
+                        continue
+                except (json.JSONDecodeError, TypeError):
+                    pass
         t = mc.get("text", "") or mc.get("data", "")
         if t:
             parts.append(str(t))
     return "".join(parts)
+
+
+def extract_mentions_from_msg_body(msg_body: list[dict]) -> list[dict]:
+    """Extract @mention elements (TIMCustomElem elem_type=1002) from msg_body.
+
+    Mirrors the openclaw-plugin-yuanbao customHandler logic:
+    TIMCustomElem with elem_type=1002 encodes an @mention, where
+    ``user_id`` is the mentioned user and ``text`` is the display text
+    (e.g. \"@张三\").
+
+    Returns a list of mention dicts:
+        { "user_id": str, "text": str }
+    """
+    mentions = []
+    for el in msg_body or []:
+        if el.get("msg_type") != "TIMCustomElem":
+            continue
+        mc = el.get("msg_content", {}) or {}
+        data_str = mc.get("data", "")
+        if not data_str or not isinstance(data_str, str):
+            continue
+        try:
+            custom = json.loads(data_str)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if custom.get("elem_type") != 1002:
+            continue
+        user_id = custom.get("user_id")
+        if user_id:
+            mentions.append({
+                "user_id": str(user_id),
+                "text": custom.get("text") or f"@{user_id}",
+            })
+    return mentions
+
+
+def is_bot_mentioned(msg_body: list[dict], bot_id: str) -> bool:
+    """Check whether the bot is @mentioned in a msg_body list."""
+    for m in extract_mentions_from_msg_body(msg_body):
+        if str(m["user_id"]) == str(bot_id):
+            return True
+    return False
 
 
 def extract_media_from_msg_body(msg_body: list[dict]) -> list[dict]:

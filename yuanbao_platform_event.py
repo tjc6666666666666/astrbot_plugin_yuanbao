@@ -9,6 +9,7 @@ Yuanbao COS before being referenced in TIMImageElem / TIMFileElem.
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from typing import TYPE_CHECKING
@@ -149,6 +150,24 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
 
             elif isinstance(comp, Video):
                 body.append({"msg_type": "TIMVideoFileElem", "msg_content": {"data": comp.file or ""}})
+
+            elif At is not None and isinstance(comp, At):
+                qq = comp.qq
+                if str(qq) == "all":
+                    body.append({"msg_type": "TIMTextElem", "msg_content": {"text": "@全体成员"}})
+                else:
+                    name = comp.name or ""
+                    text_at = f"@{name}" if name else f"@{qq}"
+                    body.append({
+                        "msg_type": "TIMCustomElem",
+                        "msg_content": {
+                            "data": json.dumps({
+                                "elem_type": 1002,
+                                "text": text_at,
+                                "user_id": str(qq),
+                            }),
+                        },
+                    })
 
             else:
                 raw = getattr(comp, "text", "") or str(comp)
