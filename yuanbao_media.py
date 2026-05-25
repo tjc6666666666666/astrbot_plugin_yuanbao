@@ -10,6 +10,7 @@ Replicates the openclaw-plugin-yuanbao media flow:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import os
@@ -399,3 +400,294 @@ async def download_and_upload(
         token=token, bot_id=bot_id, api_domain=api_domain,
         route_env=route_env, force_refresh_token=force_refresh_token,
     )
+
+
+# ── Download media (for receiving images/files) ─────
+
+_MIME_EXT_MAP = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+    "application/pdf": ".pdf",
+    "text/plain": ".txt",
+}
+
+
+def _guess_mime_type(filename: str) -> str:
+    """Guess MIME type from filename extension."""
+    ext = os.path.splitext(filename)[1].lower()
+    return {
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".bmp": "image/bmp",
+        ".pdf": "application/pdf",
+        ".doc": "application/msword",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".xls": "application/vnd.ms-excel",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".ppt": "application/vnd.ms-powerpoint",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".txt": "text/plain",
+        ".zip": "application/zip",
+        ".tar": "application/x-tar",
+        ".gz": "application/gzip",
+        ".mp3": "audio/mpeg",
+        ".mp4": "video/mp4",
+        ".wav": "audio/wav",
+        ".ogg": "audio/ogg",
+        ".webm": "video/webm",
+    }.get(ext, "application/octet-stream")
+
+
+def _infer_filename(resp, url: str, content_type: str) -> str:
+    """Infer filename from HTTP response headers or URL path."""
+    # 1. content-disposition header
+    cd = resp.headers.get("Content-Disposition", "")
+    if cd:
+        import re as _re
+        m = _re.search(r'filename\*?=(?:UTF-8\'\')?["\']?([^;"\'\r\n]+)', cd, _re.I)
+        if m:
+            try:
+                return urllib.parse.unquote(m.group(1).replace('"', "").strip())
+            except Exception:
+                pass
+    # 2. URL path last segment
+    parsed = urllib.parse.urlparse(url)
+    from_path = os.path.basename(parsed.path).strip()
+    if from_path:
+        if os.path.splitext(from_path)[1]:
+            return from_path
+        ext = _MIME_EXT_MAP.get(content_type, "")
+        if not ext and content_type.startswith("image/"):
+            ext = f".{content_type.split('/')[1]}"
+        return from_path + ext
+    # 3. random fallback
+    ext = _MIME_EXT_MAP.get(content_type, "")
+    return f"{secrets.token_hex(8)}{ext}"
+
+
+async def api_get_download_url(
+    *,
+    token: str,
+    bot_id: str,
+    api_domain: str,
+    resource_id: str,
+    session: aiohttp.ClientSession,
+    route_env: str | None = None,
+    force_refresh_token: Any = None,
+) -> str:
+    """GET /api/resource/v1/download?resourceId=... — exchange resourceId for real download URL.
+
+    If the server returns 401 the *force_refresh_token* callback is invoked once,
+    and the request is retried with the new token.
+    """
+    import platform as _platform
+
+    url = f"https://{api_domain}/api/resource/v1/download"
+    params = {"resourceId": resource_id}
+
+    for attempt in range(2):
+        headers: dict[str, str] = {
+            "X-ID": bot_id,
+            "X-Token": token,
+            "X-Source": "web",
+            "X-Instance-Id": "16",
+            "X-AppVersion": "0.0.0",
+            "X-OperationSystem": _platform.system() or "Linux",
+            "X-Bot-Version": "0.0.0",
+        }
+        if route_env:
+            headers["X-Route-Env"] = route_env
+
+        async with session.get(url, params=params, headers=headers) as resp:
+            if resp.status == 401 and attempt == 0 and force_refresh_token is not None:
+                try:
+                    new_token_data = await force_refresh_token()
+                    if new_token_data and getattr(new_token_data, "token", None):
+                        token = new_token_data.token
+                        bot_id = new_token_data.bot_id or bot_id
+                        continue
+                except Exception:
+                    pass
+
+            if not resp.ok:
+                text = await resp.text()
+                raise RuntimeError(
+                    f"apiGetDownloadUrl HTTP {resp.status}: {text[:300]}"
+                )
+            result = await resp.json()
+
+        if "code" in result and result["code"] != 0:
+            raise RuntimeError(
+                f"apiGetDownloadUrl error: code={result['code']}, msg={result.get('msg', '')[:200]}"
+            )
+
+        download_url = result.get("url") or result.get("realUrl") or result.get("data", {}).get("url")
+        if not download_url:
+            raise RuntimeError(f"apiGetDownloadUrl returned no valid URL: {result}")
+        return download_url
+
+    raise RuntimeError("apiGetDownloadUrl: 401 retry exhausted")
+
+
+async def download_media(
+    *,
+    url: str,
+    token: str = "",
+    bot_id: str = "",
+    api_domain: str = "bot.yuanbao.tencent.com",
+    media_max_mb: int = 20,
+    route_env: str | None = None,
+    force_refresh_token: Any = None,
+) -> dict[str, Any]:
+    """Download media from a yuanbao URL (or any HTTP URL / local path).
+
+    Handles:
+      - Direct HTTP/HTTPS URLs
+      - Yuanbao resourceId-based URLs (URL contains ?resourceId=xxx) → resolves via api_get_download_url()
+      - Local file paths (file://, absolute paths)
+
+    Returns: { "filename": str, "data": bytes, "mime_type": str }
+    """
+    max_bytes = media_max_mb * 1024 * 1024
+
+    # ── Local file path ──
+    if not url or (not url.startswith("http://") and not url.startswith("https://")):
+        filepath = url
+        if filepath.startswith("file:///"):
+            filepath = filepath[8:]
+        elif filepath.startswith("file://"):
+            filepath = filepath[7:]
+
+        if os.path.exists(filepath) and os.path.isfile(filepath):
+            file_size = os.path.getsize(filepath)
+            if file_size > max_bytes:
+                raise RuntimeError(
+                    f"file too large: {(file_size / 1024 / 1024):.1f} MB > {media_max_mb} MB"
+                )
+            with open(filepath, "rb") as f:
+                data = f.read()
+            filename = os.path.basename(filepath)
+            mime_type = _guess_mime_type(filename)
+            return {"filename": filename, "data": data, "mime_type": mime_type}
+        raise RuntimeError(f"local file not found: {url}")
+
+    async with aiohttp.ClientSession() as session:
+        # ── Resolve resourceId if present ──
+        fetch_url = url
+        parsed = urllib.parse.urlparse(url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        resource_id = qs.get("resourceId", [None])[0]
+        if resource_id and token and bot_id:
+            try:
+                fetch_url = await api_get_download_url(
+                    token=token, bot_id=bot_id, api_domain=api_domain,
+                    resource_id=resource_id, session=session,
+                    route_env=route_env, force_refresh_token=force_refresh_token,
+                )
+            except Exception as exc:
+                # Fall back to original URL if resourceId resolution fails
+                _logger = __import__("astrbot", fromlist=["logger"]).logger
+                _logger.warning(f"[yuanbao] resourceId download resolution failed, using raw URL: {exc}")
+
+        # ── Download ──
+        async with session.get(fetch_url) as resp:
+            if not resp.ok:
+                raise RuntimeError(f"download media failed: HTTP {resp.status} — {fetch_url[:120]}")
+
+            content_length = int(resp.headers.get("Content-Length", "0") or "0")
+            if content_length > max_bytes:
+                raise RuntimeError(
+                    f"media too large: {(content_length / 1024 / 1024):.1f} MB > {media_max_mb} MB"
+                )
+
+            data = await resp.read()
+            if len(data) > max_bytes:
+                raise RuntimeError(
+                    f"media too large: {(len(data) / 1024 / 1024):.1f} MB > {media_max_mb} MB"
+                )
+
+            content_type = resp.headers.get("Content-Type", "").split(";")[0].strip()
+            filename = _infer_filename(resp, fetch_url, content_type)
+            mime_type = content_type or _guess_mime_type(filename)
+
+    return {"filename": filename, "data": data, "mime_type": mime_type}
+
+
+async def download_medias_to_local(
+    *,
+    medias: list[dict],
+    token: str = "",
+    bot_id: str = "",
+    api_domain: str = "bot.yuanbao.tencent.com",
+    media_max_mb: int = 20,
+    route_env: str | None = None,
+    force_refresh_token: Any = None,
+    cache_dir: str | None = None,
+) -> list[dict]:
+    """Download multiple media items and save to local cache directory.
+
+    Returns a list of: { "local_path": str, "mime_type": str, "url": str, "media_type": str }
+    Individual download failures do not block others.
+    """
+    import tempfile as _tempfile
+
+    if not cache_dir:
+        cache_dir = os.path.join(_tempfile.gettempdir(), "yuanbao-media")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    async def _download_one(item: dict) -> dict | None:
+        try:
+            url = item.get("url", "")
+            if not url:
+                return None
+
+            result = await download_media(
+                url=url,
+                token=token,
+                bot_id=bot_id,
+                api_domain=api_domain,
+                media_max_mb=media_max_mb,
+                route_env=route_env,
+                force_refresh_token=force_refresh_token,
+            )
+
+            # Content-based deduplication: save as <md5>.<ext>
+            md5 = hashlib.md5(result["data"]).hexdigest()
+            ext = os.path.splitext(result["filename"])[1].lower() or (
+                _MIME_EXT_MAP.get(result["mime_type"], "")
+            )
+            md5_filename = f"{md5}{ext}" if ext else md5
+            cached_path = os.path.join(cache_dir, md5_filename)
+
+            if not os.path.exists(cached_path):
+                with open(cached_path, "wb") as f:
+                    f.write(result["data"])
+
+            return {
+                "local_path": cached_path,
+                "mime_type": result["mime_type"],
+                "url": url,
+                "media_type": item.get("type", ""),
+                "file_name": item.get("file_name", result["filename"]),
+            }
+        except Exception as exc:
+            _logger = __import__("astrbot", fromlist=["logger"]).logger
+            _logger.warning(f"[yuanbao] download media failed: {url[:80] if 'url' in dir() else '?'} — {exc}")
+            return None
+
+    # Download up to 20 concurrently
+    tasks = [asyncio.ensure_future(_download_one(item)) for item in medias[:20]]
+    results_raw = await asyncio.gather(*tasks, return_exceptions=True)
+
+    results: list[dict] = []
+    for r in results_raw:
+        if isinstance(r, Exception):
+            continue
+        if r is not None:
+            results.append(r)
+    return results

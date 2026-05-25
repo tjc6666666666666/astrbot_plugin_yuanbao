@@ -487,6 +487,67 @@ def extract_text_from_msg_body(msg_body: list[dict]) -> str:
     return "".join(parts)
 
 
+def extract_media_from_msg_body(msg_body: list[dict]) -> list[dict]:
+    """Extract media elements (Image, File, Record, Video) from msg_body.
+
+    Returns a list of media item dicts:
+        { "type": "image"|"file"|"record"|"video",
+          "url": str | None,
+          "file_name": str | None,
+          "msg_content": dict (raw msg_content) }
+
+    Text elements are skipped.
+    """
+    media_items: list[dict] = []
+    for el in msg_body or []:
+        msg_type = el.get("msg_type", "")
+        mc = el.get("msg_content", {}) or {}
+
+        if msg_type == "TIMImageElem":
+            # image_info_array may have multiple sizes; prefer index 1 (medium), fallback to 0
+            info_arr = mc.get("image_info_array") or mc.get("imageInfoArray") or []
+            img_info = (info_arr[1] if len(info_arr) > 1 else None) or (
+                info_arr[0] if len(info_arr) > 0 else None
+            )
+            url = img_info.get("url") if isinstance(img_info, dict) else None
+            media_items.append({
+                "type": "image",
+                "url": url,
+                "file_name": mc.get("uuid") or mc.get("file_name") or "image",
+                "msg_content": mc,
+            })
+
+        elif msg_type == "TIMFileElem":
+            url = mc.get("url") or ""
+            file_name = mc.get("file_name") or mc.get("fileName") or "file"
+            media_items.append({
+                "type": "file",
+                "url": url,
+                "file_name": file_name,
+                "msg_content": mc,
+            })
+
+        elif msg_type == "TIMSoundElem":
+            url = mc.get("sound") or mc.get("url") or ""
+            media_items.append({
+                "type": "record",
+                "url": url,
+                "file_name": mc.get("file_name") or mc.get("fileName") or "audio",
+                "msg_content": mc,
+            })
+
+        elif msg_type == "TIMVideoFileElem":
+            url = mc.get("data") or mc.get("url") or ""
+            media_items.append({
+                "type": "video",
+                "url": url,
+                "file_name": mc.get("file_name") or mc.get("fileName") or "video",
+                "msg_content": mc,
+            })
+
+    return media_items
+
+
 # ─────────────────────────────────────────────
 #  Sequence number generator
 # ─────────────────────────────────────────────

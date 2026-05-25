@@ -123,7 +123,8 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
                 body.append({"msg_type": "TIMTextElem", "msg_content": {"text": "[图片]"}})
 
             elif isinstance(comp, File):
-                file_url = comp.url or comp.file_ or ""
+                # File.file_ = local path; File.url = remote URL (File.file is a @property — avoid)
+                file_url = comp.file_ or comp.url or ""
                 file_name = comp.name or os.path.basename(file_url) or "file"
                 if file_url and (file_url.startswith("http://") or file_url.startswith("https://")):
                     uploaded = await self._upload_file(file_url, file_name)
@@ -132,7 +133,16 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
                     else:
                         body.append({"msg_type": "TIMTextElem", "msg_content": {"text": file_url}})
                 else:
-                    body.append({"msg_type": "TIMTextElem", "msg_content": {"text": f"[文件: {file_name}]"}})
+                    # Try local file path (like Image already supports)
+                    local_fp = self._extract_local_path_for_file(comp)
+                    if local_fp:
+                        uploaded = await self._upload_file_file(local_fp, file_name)
+                        if uploaded:
+                            body.append(uploaded)
+                        else:
+                            body.append({"msg_type": "TIMTextElem", "msg_content": {"text": f"[文件: {file_name}]"}})
+                    else:
+                        body.append({"msg_type": "TIMTextElem", "msg_content": {"text": f"[文件: {file_name}]"}})
 
             elif isinstance(comp, Record):
                 body.append({"msg_type": "TIMSoundElem", "msg_content": {"sound": comp.file or ""}})
@@ -328,6 +338,74 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
         except Exception as exc:
             logger.warning(f"[yuanbao] local file upload failed ({filepath}): {exc}")
             return None
+
+    async def _upload_file_file(self, filepath: str, file_name: str = "") -> dict | None:
+        """Read local file → upload to COS → TIMFileElem.  Returns None on failure."""
+        import mimetypes
+        try:
+            with open(filepath, "rb") as f:
+                data = f.read()
+            content_type, _ = mimetypes.guess_type(filepath)
+            if not content_type:
+                content_type = "application/octet-stream"
+            return await self._upload_file_data(data, content_type, file_name or os.path.basename(filepath))
+        except Exception as exc:
+            logger.warning(f"[yuanbao] local file upload failed ({filepath}): {exc}")
+            return None
+
+    async def _upload_file_data(self, data: bytes, content_type: str, file_name: str = "file") -> dict | None:
+        """Upload raw file bytes to COS → TIMFileElem.  Returns None on failure."""
+        try:
+            from .yuanbao_media import upload_raw
+
+            refresh_cb = self._make_token_refresh_cb()
+            result = await upload_raw(
+                data=data, filename=file_name, content_type=content_type,
+                token=self._token, bot_id=self.from_account or "",
+                api_domain=self._api_domain, route_env=self._route_env,
+                force_refresh_token=refresh_cb,
+            )
+            return {
+                "msg_type": "TIMFileElem",
+                "msg_content": {
+                    "uuid": result["uuid"],
+                    "file_name": result["filename"] or file_name,
+                    "file_size": result["size"],
+                    "url": result["url"],
+                },
+            }
+        except Exception as exc:
+            logger.warning(f"[yuanbao] file data upload failed: {exc}")
+            return None
+
+    @staticmethod
+    def _extract_local_path_for_file(comp: File) -> str | None:
+        """Extract a local file path from a File component (file:// or bare path).
+
+        Note: File.file is a @property that may trigger sync download — avoid it.
+        Use file_ (local path) and url (remote URL) instead.
+        """
+        candidates = [
+            getattr(comp, "file_", None),
+            getattr(comp, "url", None),
+            getattr(comp, "path", None),
+        ]
+        for c in candidates:
+            if not c:
+                continue
+            c = str(c).strip()
+            if c.startswith("file:///"):
+                p = c[8:]
+                if os.path.exists(p):
+                    return p
+            elif c.startswith("file://"):
+                p = c[7:]
+                if os.path.exists(p):
+                    return p
+            elif not c.startswith("http://") and not c.startswith("https://"):
+                if os.path.exists(c):
+                    return c
+        return None
 
     async def _upload_image_data(self, data: bytes, content_type: str) -> dict | None:
         """Upload raw image bytes to COS → TIMImageElem.  Returns None on failure."""

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 from typing import Any
 
@@ -33,8 +34,9 @@ from astrbot.api.platform import (
     register_platform_adapter,
 )
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import Plain
+from astrbot.api.message_components import Plain, Image, File, Record, Video
 from astrbot.core.platform.astr_message_event import MessageSesion
+from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 from astrbot import logger
 
 from .yuanbao_client import YuanbaoWsClient, ClientState
@@ -42,6 +44,7 @@ from .yuanbao_sign import sign_token, SignTokenError
 from .yuanbao_codec import (
     parse_push_content_to_msg_body,
     extract_text_from_msg_body,
+    extract_media_from_msg_body,
 )
 from .yuanbao_platform_event import YuanbaoPlatformEvent
 from . import yuanbao_codec as codec
@@ -326,12 +329,70 @@ class YuanbaoPlatformAdapter(Platform):
         nickname = extra.get("sender_nickname") or extra.get("senderNickname") or ""
         abm.sender = MessageMember(user_id=from_uid, nickname=nickname)
 
-        # Message content
+        # Message content — extract text + media
         abm.message_str = extract_text_from_msg_body(msg_body)
         abm.message = [Plain(text=abm.message_str)]
 
-        # TODO: enrich message chain with Image/File/Record components
-        # for non-text elements in msg_body after implementing full biz-codec.
+        # Extract media elements from msg_body and populate Image/File/Record/Video components
+        media_items = extract_media_from_msg_body(msg_body)
+        for mi in media_items:
+            media_type = mi.get("type", "")
+            if media_type == "image":
+                abm.message.append(Image(file=mi.get("url", "")))
+            elif media_type == "file":
+                abm.message.append(File(
+                    name=mi.get("file_name", "file"),
+                    url=mi.get("url", ""),
+                ))
+            elif media_type == "record":
+                abm.message.append(Record(file=mi.get("url", "")))
+            elif media_type == "video":
+                abm.message.append(Video(file=mi.get("url", "")))
+
+        # Download media to local temp paths so AI agents can access them
+        if media_items:
+            try:
+                from .yuanbao_media import download_medias_to_local
+
+                cache_dir = os.path.join(get_astrbot_temp_path(), "yuanbao-media")
+
+                refresh_cb = self._make_media_token_refresh_cb()
+                local_results = await download_medias_to_local(
+                    medias=media_items,
+                    token=self._token,
+                    bot_id=self._from_account,
+                    api_domain=self.config.get("api_domain", DEFAULT_API_DOMAIN),
+                    route_env=self._route_env,
+                    force_refresh_token=refresh_cb,
+                    cache_dir=cache_dir,
+                )
+                # Replace URL-only image/file components with local‑path versions
+                new_chain: list = [abm.message[0]]  # keep Plain text
+                result_by_url = {r["url"]: r for r in local_results}
+                for comp in abm.message[1:]:
+                    # Image.file holds URL/path; File.url holds remote URL, File.file_ holds local path
+                    comp_url = getattr(comp, "file", "") or getattr(comp, "url", "") or getattr(comp, "file_", "")
+                    if comp_url and comp_url in result_by_url:
+                        r = result_by_url[comp_url]
+                        local_path = r["local_path"]
+                        if isinstance(comp, Image):
+                            new_chain.append(Image(file=local_path))
+                        elif isinstance(comp, File):
+                            new_chain.append(File(
+                                name=getattr(comp, "name", None) or r.get("file_name", "file"),
+                                file=local_path,  # constructor maps file → file_
+                            ))
+                        elif isinstance(comp, Record):
+                            new_chain.append(Record(file=local_path))
+                        elif isinstance(comp, Video):
+                            new_chain.append(Video(file=local_path))
+                        else:
+                            new_chain.append(comp)
+                    else:
+                        new_chain.append(comp)
+                abm.message = new_chain
+            except Exception as exc:
+                logger.warning(f"[yuanbao] media download failed, using remote URLs: {exc}")
 
         abm.raw_message = push
         abm.self_id = self._from_account
@@ -383,6 +444,35 @@ class YuanbaoPlatformAdapter(Platform):
             self._app_key = explicit_key
         if explicit_secret:
             self._app_secret = explicit_secret
+
+    def _make_media_token_refresh_cb(self):
+        """Return an async callable that re‑signs the token for media download retries."""
+        app_key = self._app_key
+        app_secret = self._app_secret
+        api_domain = self.config.get("api_domain", DEFAULT_API_DOMAIN)
+        route_env = self._route_env
+        adapter = self
+
+        async def _refresh() -> object | None:
+            if not app_key or not app_secret:
+                logger.error("[yuanbao] cannot refresh token for media: missing app_key/app_secret")
+                return None
+            try:
+                data = await sign_token(
+                    app_key=app_key,
+                    app_secret=app_secret,
+                    api_domain=api_domain,
+                    route_env=route_env,
+                )
+                adapter._token = data.token
+                adapter._from_account = data.bot_id
+                logger.info(f"[yuanbao] token refreshed during media download, bot_id={data.bot_id}")
+                return data
+            except SignTokenError as exc:
+                logger.error(f"[yuanbao] token refresh during media download failed: {exc}")
+                return None
+
+        return _refresh
 
     # ── Outbound send (called by event class) ────────
 
