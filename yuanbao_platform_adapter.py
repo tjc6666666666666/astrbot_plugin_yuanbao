@@ -37,7 +37,7 @@ from astrbot.api.event import MessageChain
 from astrbot.api.message_components import Plain, Image, File, Record, Video
 from astrbot.core.platform.astr_message_event import MessageSesion
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
-from astrbot import logger
+from astrbot.api import logger
 
 from .yuanbao_client import YuanbaoWsClient, ClientState
 from .yuanbao_sign import sign_token, SignTokenError
@@ -370,8 +370,8 @@ class YuanbaoPlatformAdapter(Platform):
                 new_chain: list = [abm.message[0]]  # keep Plain text
                 result_by_url = {r["url"]: r for r in local_results}
                 for comp in abm.message[1:]:
-                    # Image.file holds URL/path; File.url holds remote URL, File.file_ holds local path
-                    comp_url = getattr(comp, "file", "") or getattr(comp, "url", "") or getattr(comp, "file_", "")
+                    # Image uses `file` attr; File uses `url` attr (avoid File.file — it's a @property)
+                    comp_url = getattr(comp, "url", "") or getattr(comp, "file_", "") or getattr(comp, "file", "")
                     if comp_url and comp_url in result_by_url:
                         r = result_by_url[comp_url]
                         local_path = r["local_path"]

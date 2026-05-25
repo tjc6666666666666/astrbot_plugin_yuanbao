@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 from astrbot.api.event import AstrMessageEvent, MessageChain
 from astrbot.api.platform import AstrBotMessage, PlatformMetadata
 from astrbot.api.message_components import Plain, Image, File, Record, Video
-from astrbot import logger
+from astrbot.api import logger
 
 if TYPE_CHECKING:
     from .yuanbao_client import YuanbaoWsClient

@@ -204,7 +204,7 @@ class YuanbaoWsClient:
             self._heartbeat_timeout_count = 0
 
         self._heartbeat_ack_received = False
-        self._last_heartbeat_at = asyncio.get_event_loop().time()
+        self._last_heartbeat_at = asyncio.get_running_loop().time()
 
         msg_id = _generate_msg_id()
         head = codec.encode_head(
@@ -429,6 +429,8 @@ class YuanbaoWsClient:
         # First ping after 5s
         await asyncio.sleep(5)
         while True:
+            if self._disposed:
+                break
             try:
                 await self._send_ping()
             except Exception:

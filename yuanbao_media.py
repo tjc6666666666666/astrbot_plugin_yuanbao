@@ -22,6 +22,8 @@ from typing import Any
 
 import aiohttp
 
+from astrbot.api import logger
+
 
 # ── helpers  ─────────────────────────────────────
 
@@ -288,8 +290,7 @@ async def api_get_upload_info(
         # Original returns json.data ?? json (data field or whole response)
         data = result.get("data", result)
 
-        _logger = __import__("astrbot", fromlist=["logger"]).logger
-        _logger.info(f"[yuanbao][genUploadInfo] response keys={list(data.keys())[:10]}")
+        logger.info(f"[yuanbao][genUploadInfo] response keys={list(data.keys())[:10]}")
         required = ("bucketName", "region", "location",
                     "encryptTmpSecretId", "encryptTmpSecretKey",
                     "encryptToken", "startTime", "expiredTime", "resourceUrl")
@@ -591,8 +592,7 @@ async def download_media(
                 )
             except Exception as exc:
                 # Fall back to original URL if resourceId resolution fails
-                _logger = __import__("astrbot", fromlist=["logger"]).logger
-                _logger.warning(f"[yuanbao] resourceId download resolution failed, using raw URL: {exc}")
+                logger.warning(f"[yuanbao] resourceId download resolution failed, using raw URL: {exc}")
 
         # ── Download ──
         async with session.get(fetch_url) as resp:
@@ -676,8 +676,7 @@ async def download_medias_to_local(
                 "file_name": item.get("file_name", result["filename"]),
             }
         except Exception as exc:
-            _logger = __import__("astrbot", fromlist=["logger"]).logger
-            _logger.warning(f"[yuanbao] download media failed: {url[:80] if 'url' in dir() else '?'} — {exc}")
+            logger.warning(f"[yuanbao] download media failed: {url[:80] if 'url' in dir() else '?'} — {exc}")
             return None
 
     # Download up to 20 concurrently
