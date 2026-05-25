@@ -70,7 +70,7 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
                 "msg_content": {"text": message.get_plain_text() or "(empty)"},
             }]
 
-        envelope = self._build_envelope(msg_body)
+        envelope = self._build_envelope(msg_body, message)
 
         try:
             await self._send_envelope(envelope)
@@ -269,7 +269,7 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
 
     # ── envelope / dispatch  ──────────────────────
 
-    def _build_envelope(self, msg_body: list[dict]) -> dict:
+    def _build_envelope(self, msg_body: list[dict], message: MessageChain | None = None) -> dict:
         from astrbot.core.platform.message_type import MessageType
 
         msg_obj = self.message_obj
@@ -293,7 +293,32 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
         if group_code:
             env["group_code"] = group_code
         env["_is_group"] = is_group or bool(group_code)
+
+        # Attach ref_msg_id for group reply quoting ONLY when AstrBot's
+        # ResultDecorateStage has inserted a Reply component into the chain
+        # (controlled by the reply_with_quote config).  This mirrors how the
+        # Telegram / aiocqhttp adapters handle outbound quoting.
+        if is_group and group_code and message is not None:
+            ref_msg_id = self._extract_ref_msg_id(message)
+            if ref_msg_id:
+                env["ref_msg_id"] = str(ref_msg_id)
+
         return env
+
+    @staticmethod
+    def _extract_ref_msg_id(message: MessageChain) -> str | None:
+        """Look for a Reply component in the outgoing MessageChain.
+
+        The Reply component is injected by AstrBot's ``ResultDecorateStage``
+        when ``reply_with_quote`` is enabled.  If present, its ``id`` is used
+        as ``refMsgId`` in the protobuf SendGroupMessageReq.
+        """
+        from astrbot.api.message_components import Reply as ReplyComp
+
+        for comp in getattr(message, "chain", []) or []:
+            if isinstance(comp, ReplyComp) and comp.id:
+                return str(comp.id)
+        return None
 
     async def _send_envelope(self, envelope: dict) -> None:
         import random as _random
@@ -313,6 +338,7 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
         group_code = envelope.get("group_code", "")
         is_group = envelope.get("_is_group", False)
         msg_random = envelope.get("msg_random", _random.randint(0, 2**32 - 1))
+        ref_msg_id = envelope.get("ref_msg_id", "")
 
         if is_group or group_code:
             biz_data = codec.encode_send_group_message_req(
@@ -321,6 +347,7 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
                 from_account=from_account,
                 to_account=to_account,
                 msg_random=msg_random,
+                ref_msg_id=str(ref_msg_id) if ref_msg_id else "",
             )
             cmd = codec.BIZ_CMD_SEND_GROUP
         else:
