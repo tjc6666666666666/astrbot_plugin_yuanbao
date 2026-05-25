@@ -86,7 +86,6 @@ class YuanbaoPlatformAdapter(Platform):
         self.config = platform_config
         self.settings = platform_settings
         self.client: YuanbaoWsClient | None = None
-        self._task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
         self._app_key: str = ""
         self._app_secret: str = ""

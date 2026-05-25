@@ -240,14 +240,25 @@ class YuanbaoWsClient:
         assert self._ws is not None
         try:
             async for raw in self._ws:
-                if isinstance(raw, bytes):
-                    await self._on_message(raw)
-                elif isinstance(raw, str):
-                    await self._on_message(raw.encode("utf-8"))
+                try:
+                    if isinstance(raw, bytes):
+                        await self._on_message(raw)
+                    elif isinstance(raw, str):
+                        await self._on_message(raw.encode("utf-8"))
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
         except ConnectionClosed as exc:
             code = exc.code or 1000
             reason = exc.reason or ""
             await self._on_close(code, reason)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            try:
+                await self._on_close(1006, f"_recv_loop unexpected error: {exc}")
+            except Exception:
+                pass
 
     async def _on_message(self, data: bytes) -> None:
         conn_msg = codec.decode_conn_msg(data)
@@ -395,7 +406,11 @@ class YuanbaoWsClient:
     async def _on_close(self, code: int, reason: str) -> None:
         self._stop_heartbeat()
         if self.on_close:
-            await self.on_close(code, reason)
+            try:
+                await self.on_close(code, reason)
+            except Exception:
+                import traceback
+                traceback.print_exc()
         if self._disposed:
             return
         if code in NO_RECONNECT_CLOSE_CODES:
