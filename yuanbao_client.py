@@ -154,15 +154,23 @@ class YuanbaoWsClient:
                     ping_interval=None,  # we handle heartbeat ourselves
                 )
             except Exception as exc:
-                await self._on_ws_error(str(exc))
-                return
+                _connect_err = str(exc)
+            else:
+                _connect_err = None
 
-            # Send auth-bind
-            await self._set_state(ClientState.AUTHENTICATING)
-            await self._send_auth_bind()
+        # ── Handle connection error OUTSIDE the lock ──
+        # Calling _on_ws_error inside the lock would trigger _schedule_reconnect
+        # → _do_connect again, causing an asyncio.Lock reentry deadlock.
+        if _connect_err is not None:
+            await self._on_ws_error(_connect_err)
+            return
 
-            # Start receive loop
-            self._recv_task = asyncio.create_task(self._recv_loop())
+        # Send auth-bind (still protected by CONNECTING state)
+        await self._set_state(ClientState.AUTHENTICATING)
+        await self._send_auth_bind()
+
+        # Start receive loop
+        self._recv_task = asyncio.create_task(self._recv_loop())
 
     async def _send_auth_bind(self) -> None:
         auth = self.auth

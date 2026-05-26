@@ -16,6 +16,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 
+import aiohttp
+
 # Beijing timezone (UTC+8)
 _BJ_TZ = timezone(timedelta(hours=8))
 
@@ -29,6 +31,9 @@ CACHE_REFRESH_MARGIN_S = 5 * 60
 
 # Friendly retryable sign-token code
 RETRYABLE_SIGN_CODE = 10099
+
+# HTTP timeout for sign-token API calls
+_SIGN_TIMEOUT = aiohttp.ClientTimeout(total=10, connect=5)
 
 
 @dataclass
@@ -89,7 +94,7 @@ async def sign_token(
     Attempts up to SIGN_MAX_RETRIES times if the server returns a
     retryable error code (10099).  Uses HMAC-SHA256 for the signature.
     """
-    import aiohttp
+    import platform as _platform
 
     url = f"https://{api_domain}{SIGN_TOKEN_PATH}"
     close_session = session is None
@@ -119,7 +124,7 @@ async def sign_token(
             if route_env:
                 headers["x-route-env"] = route_env
 
-            async with session.post(url, json=body, headers=headers) as resp:
+            async with session.post(url, json=body, headers=headers, timeout=_SIGN_TIMEOUT) as resp:
                 if not resp.ok:
                     raise SignTokenError(
                         f"sign-token HTTP {resp.status} {resp.reason}"

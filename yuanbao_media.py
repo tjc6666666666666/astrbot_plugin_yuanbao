@@ -24,6 +24,16 @@ import aiohttp
 
 from astrbot.api import logger
 
+# ── HTTP request defaults ────────────────────────
+# Hard timeouts prevent indefinite hangs when the remote server is slow
+# or unresponsive.  DOWNLOAD_CHUNK_SIZE limits per-chunk memory pressure.
+DOWNLOAD_TIMEOUT = aiohttp.ClientTimeout(
+    total=30,        # whole operation (connect + read)
+    connect=10,      # TCP connect
+    sock_read=20,    # between chunks
+)
+DOWNLOAD_MAX_CHUNK_BYTES = 65536  # 64 KiB per chunk
+STREAM_RATE_LIMIT = 5 * 1024 * 1024  # 5 MB/s per-stream throttle hint
 
 # ── helpers  ─────────────────────────────────────
 
@@ -262,7 +272,7 @@ async def api_get_upload_info(
         if route_env:
             headers["X-Route-Env"] = route_env
 
-        async with session.post(url, json=body, headers=headers) as resp:
+        async with session.post(url, json=body, headers=headers, timeout=DOWNLOAD_TIMEOUT) as resp:
             if resp.status == 401 and attempt == 0 and force_refresh_token is not None:
                 # Token expired — refresh and retry once
                 try:
@@ -380,15 +390,30 @@ async def download_and_upload(
     max_bytes = media_max_mb * 1024 * 1024
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(image_url) as resp:
+        # ── Download image with chunked streaming + early size abort ──
+        async with session.get(image_url, timeout=DOWNLOAD_TIMEOUT) as resp:
             if not resp.ok:
                 raise RuntimeError(f"download image failed: HTTP {resp.status} — {image_url[:120]}")
-            img_data = await resp.read()
 
-        if len(img_data) > max_bytes:
-            raise RuntimeError(f"image too large: {(len(img_data) / 1024 / 1024):.1f} MB > {media_max_mb} MB")
+            content_type = resp.headers.get("Content-Type", "image/png").split(";")[0].strip()
 
-        content_type = resp.headers.get("Content-Type", "image/png").split(";")[0].strip()
+            # Quick reject via Content-Length header
+            content_length = resp.content_length
+            if content_length is not None and content_length > max_bytes:
+                raise RuntimeError(
+                    f"image too large: {(content_length / 1024 / 1024):.1f} MB > {media_max_mb} MB"
+                )
+
+            # Stream chunk-by-chunk, abort early if exceeding limit
+            img_data = bytearray()
+            async for chunk in resp.content.iter_chunked(DOWNLOAD_MAX_CHUNK_BYTES):
+                img_data.extend(chunk)
+                if len(img_data) > max_bytes:
+                    raise RuntimeError(
+                        f"image too large during stream: {(len(img_data) / 1024 / 1024):.1f} MB > {media_max_mb} MB"
+                    )
+            img_data = bytes(img_data)
+
         parsed = urllib.parse.urlparse(image_url)
         filename = os.path.basename(parsed.path) or "image.png"
         if "." not in filename.rsplit("/", 1)[-1]:
@@ -504,7 +529,7 @@ async def api_get_download_url(
         if route_env:
             headers["X-Route-Env"] = route_env
 
-        async with session.get(url, params=params, headers=headers) as resp:
+        async with session.get(url, params=params, headers=headers, timeout=DOWNLOAD_TIMEOUT) as resp:
             if resp.status == 401 and attempt == 0 and force_refresh_token is not None:
                 try:
                     new_token_data = await force_refresh_token()
@@ -594,28 +619,34 @@ async def download_media(
                 # Fall back to original URL if resourceId resolution fails
                 logger.warning(f"[yuanbao] resourceId download resolution failed, using raw URL: {exc}")
 
-        # ── Download ──
-        async with session.get(fetch_url) as resp:
+        # ── Download with chunked streaming + early size abort ──
+        async with session.get(fetch_url, timeout=DOWNLOAD_TIMEOUT) as resp:
             if not resp.ok:
                 raise RuntimeError(f"download media failed: HTTP {resp.status} — {fetch_url[:120]}")
-
-            content_length = int(resp.headers.get("Content-Length", "0") or "0")
-            if content_length > max_bytes:
-                raise RuntimeError(
-                    f"media too large: {(content_length / 1024 / 1024):.1f} MB > {media_max_mb} MB"
-                )
-
-            data = await resp.read()
-            if len(data) > max_bytes:
-                raise RuntimeError(
-                    f"media too large: {(len(data) / 1024 / 1024):.1f} MB > {media_max_mb} MB"
-                )
 
             content_type = resp.headers.get("Content-Type", "").split(";")[0].strip()
             filename = _infer_filename(resp, fetch_url, content_type)
             mime_type = content_type or _guess_mime_type(filename)
 
-    return {"filename": filename, "data": data, "mime_type": mime_type}
+            # Quick reject via Content-Length header
+            content_length = resp.content_length
+            if content_length is not None and content_length > max_bytes:
+                raise RuntimeError(
+                    f"media too large: {(content_length / 1024 / 1024):.1f} MB > {media_max_mb} MB"
+                )
+
+            # Stream chunk-by-chunk and abort early if the limit is exceeded.
+            # Prevents OOM when a malicious/slow server omits Content-Length
+            # or sends an unexpectedly large body.
+            data = bytearray()
+            async for chunk in resp.content.iter_chunked(DOWNLOAD_MAX_CHUNK_BYTES):
+                data.extend(chunk)
+                if len(data) > max_bytes:
+                    raise RuntimeError(
+                        f"media too large during stream: {(len(data) / 1024 / 1024):.1f} MB > {media_max_mb} MB"
+                    )
+
+    return {"filename": filename, "data": bytes(data), "mime_type": mime_type}
 
 
 async def download_medias_to_local(
