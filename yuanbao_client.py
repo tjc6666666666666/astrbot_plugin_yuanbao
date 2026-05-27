@@ -19,6 +19,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import logging
 import platform
 import uuid
 from dataclasses import dataclass, field
@@ -30,6 +31,8 @@ from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
 from . import yuanbao_codec as codec
+
+logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
 #  Constants (mirror openclaw-plugin-yuanbao)
@@ -43,6 +46,11 @@ HEARTBEAT_TIMEOUT_THRESHOLD = 2
 AUTH_FAILED_CODES: set[int] = {41103, 41104, 41108}
 AUTH_ALREADY_CODE = 41101
 AUTH_RETRYABLE_CODES: set[int] = {50400, 50503, 90001, 90003}
+
+# ── Connection guard ─────────────────────────
+# Hard timeout for the entire websockets.connect() call (DNS + TCP + TLS).
+# Prevents indefinite hangs on DNS failures (e.g. getaddrinfo).
+CONNECT_TIMEOUT_S = 15
 
 
 class ClientState(str, Enum):
@@ -98,6 +106,7 @@ class YuanbaoWsClient:
     _heartbeat_timeout_count: int = field(default=0, init=False)
     _last_heartbeat_at: float = field(default=0.0, init=False)
     _reconnect_attempts: int = field(default=0, init=False)
+    _reconnecting: bool = field(default=False, init=False)  # guard against concurrent reconnection loops
     _disposed: bool = field(default=False, init=False)
     _heartbeat_task: asyncio.Task | None = field(default=None, init=False)
     _recv_task: asyncio.Task | None = field(default=None, init=False)
@@ -112,7 +121,9 @@ class YuanbaoWsClient:
         """Initiate connection and start the receive loop."""
         if self._disposed:
             raise RuntimeError("Client has been disposed")
-        await self._do_connect()
+        ok = await self._do_connect()
+        if not ok and not self._disposed:
+            await self._schedule_reconnect()
 
     async def disconnect(self) -> None:
         self._disposed = True
@@ -138,39 +149,53 @@ class YuanbaoWsClient:
             except Exception:
                 pass
 
-    async def _do_connect(self, *, is_reconnect: bool = False) -> None:
+    async def _do_connect(self, *, is_reconnect: bool = False) -> bool:
+        """Attempt one connection.  Returns ``True`` on success, ``False`` on failure.
+
+        On failure the error is reported via ``on_error`` (outside the lock) but
+        *no* automatic reconnect is scheduled — the caller is responsible for
+        that, which avoids recursive call-chain buildup.
+        """
         if self._disposed:
-            return
+            return False
 
         async with self._connection_lock:
             await self._set_state(
                 ClientState.RECONNECTING if is_reconnect else ClientState.CONNECTING
             )
             try:
-                # Use websockets to connect
-                self._ws = await websockets.connect(
-                    self.gateway_url,
-                    max_size=2**24,
-                    ping_interval=None,  # we handle heartbeat ourselves
+                # Hard timeout prevents hanging on DNS failures (getaddrinfo)
+                # or slow/unreachable servers.
+                self._ws = await asyncio.wait_for(
+                    websockets.connect(
+                        self.gateway_url,
+                        max_size=2**24,
+                        ping_interval=None,  # we handle heartbeat ourselves
+                    ),
+                    timeout=CONNECT_TIMEOUT_S,
                 )
+            except asyncio.TimeoutError:
+                _connect_err = f"connect timed out after {CONNECT_TIMEOUT_S}s"
+            except OSError as exc:
+                _connect_err = f"connect failed (network): {exc}"
             except Exception as exc:
                 _connect_err = str(exc)
             else:
                 _connect_err = None
 
-        # ── Handle connection error OUTSIDE the lock ──
-        # Calling _on_ws_error inside the lock would trigger _schedule_reconnect
-        # → _do_connect again, causing an asyncio.Lock reentry deadlock.
+        # Handle error OUTSIDE the lock (prevents reentrant deadlock),
+        # but do NOT schedule a reconnect here — return to the caller.
         if _connect_err is not None:
-            await self._on_ws_error(_connect_err)
-            return
+            if self.on_error:
+                await self.on_error(_connect_err)
+            return False
 
-        # Send auth-bind (still protected by CONNECTING state)
+        # Connection established — send auth & start recv loop
         await self._set_state(ClientState.AUTHENTICATING)
         await self._send_auth_bind()
 
-        # Start receive loop
         self._recv_task = asyncio.create_task(self._recv_loop())
+        return True
 
     async def _send_auth_bind(self) -> None:
         auth = self.auth
@@ -431,6 +456,7 @@ class YuanbaoWsClient:
         await self._schedule_reconnect()
 
     async def _on_ws_error(self, message: str) -> None:
+        """Report a non-fatal error and begin the reconnection loop."""
         if self.on_error:
             await self.on_error(message)
         if not self._disposed:
@@ -467,24 +493,48 @@ class YuanbaoWsClient:
         await self._close_ws()
         await self._schedule_reconnect()
 
-    async def _schedule_reconnect(self, delay: float | None = None) -> None:
+    async def _schedule_reconnect(self) -> None:
+        """Reconnection loop — retries indefinitely until connected or disposed.
+
+        Unlike the previous recursive design (``_do_connect`` → error
+        → ``_schedule_reconnect`` → ``_do_connect`` → …), this is a flat
+        ``while`` loop.  This avoids deep coroutine-chain buildup and
+        makes the client resilient to extended network outages — it will
+        keep retrying without a hard ceiling.
+        """
         if self._disposed:
             return
-        if self._reconnect_attempts >= self.max_reconnect_attempts:
-            await self._set_state(ClientState.DISCONNECTED)
-            if self.on_error:
-                await self.on_error(
-                    f"Max reconnect attempts ({self.max_reconnect_attempts}) exceeded"
+        if self._reconnecting:
+            return  # already inside a reconnection loop
+        self._reconnecting = True
+
+        try:
+            while not self._disposed:
+                idx = min(self._reconnect_attempts, len(self.reconnect_delays) - 1)
+                delay = self.reconnect_delays[idx]
+                self._reconnect_attempts += 1
+
+                logger.info(
+                    "Reconnecting in %.0fs (attempt %d)",
+                    delay, self._reconnect_attempts,
                 )
-            return
-        if delay is None:
-            idx = min(self._reconnect_attempts, len(self.reconnect_delays) - 1)
-            delay = self.reconnect_delays[idx]
-        self._reconnect_attempts += 1
-        await self._set_state(ClientState.RECONNECTING)
-        await asyncio.sleep(delay)
-        if not self._disposed:
-            await self._do_connect(is_reconnect=True)
+
+                await self._set_state(ClientState.RECONNECTING)
+                await asyncio.sleep(delay)
+
+                if self._disposed:
+                    return
+
+                ok = await self._do_connect(is_reconnect=True)
+                if ok:
+                    self._reconnect_attempts = 0
+                    return  # success
+
+                # Loop continues — _do_connect already called on_error internally
+        finally:
+            self._reconnecting = False
+            if self._disposed:
+                await self._set_state(ClientState.DISCONNECTED)
 
     async def _try_auth_failed_refresh(self, error_code: int) -> None:
         """Call on_auth_failed callback to refresh token, then reconnect."""
