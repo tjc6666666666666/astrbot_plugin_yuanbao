@@ -13,8 +13,7 @@ Configuration (stored in AstrBot's platform config):
   app_key  + app_secret – individual credentials
   ws_url  – optional, defaults to wss://bot-wss.yuanbao.tencent.com/wss/connection
   api_domain – optional, defaults to bot.yuanbao.tencent.com
-  require_mention – whether group chat requires @mention (default True)
-  enabled – boolean flag
+  enable – boolean flag
 """
 
 from __future__ import annotations
@@ -51,6 +50,7 @@ from .yuanbao_codec import (
     extract_text_from_msg_body,
     extract_media_from_msg_body,
     extract_mentions_from_msg_body,
+    decode_inbound_message,
 )
 from .yuanbao_platform_event import YuanbaoPlatformEvent
 from . import yuanbao_codec as codec
@@ -74,9 +74,48 @@ _active_adapters: dict[str, "YuanbaoPlatformAdapter"] = {}
         "app_secret": "",
         "ws_url": DEFAULT_WS_URL,
         "api_domain": DEFAULT_API_DOMAIN,
-        "require_mention": True,
         "enable": False,
         "id": "yuanbao",
+    },
+    config_metadata={
+        "token": {
+            "description": "应用凭据（appKey:appSecret）",
+            "type": "string",
+            "hint": "含冒号分隔的 appKey:appSecret 字符串。若已填此字段，则 app_key 和 app_secret 可留空。必填。",
+            "obvious_hint": True,
+        },
+        "app_key": {
+            "description": "应用 Key",
+            "type": "string",
+            "hint": "从腾讯元宝开放平台获取的应用 Key，与 app_secret 搭配使用。若已填写 token 则非必填。",
+            "obvious_hint": True,
+        },
+        "app_secret": {
+            "description": "应用 Secret",
+            "type": "string",
+            "hint": "从腾讯元宝开放平台获取的应用 Secret，与 app_key 搭配使用。若已填写 token 则非必填。",
+            "obvious_hint": True,
+        },
+        "ws_url": {
+            "description": "WebSocket 连接地址",
+            "type": "string",
+            "hint": "腾讯元宝 WebSocket 网关地址，默认 wss://bot-wss.yuanbao.tencent.com/wss/connection。通常无需修改。",
+        },
+        "api_domain": {
+            "description": "API 域名",
+            "type": "string",
+            "hint": "腾讯元宝开放平台 API 域名，默认 bot.yuanbao.tencent.com。用于令牌签名和媒体资源下载。通常无需修改。",
+        },
+        "enable": {
+            "description": "启用适配器",
+            "type": "bool",
+            "hint": "开启后适配器才会启动并连接腾讯元宝平台。默认关闭，需手动开启。",
+        },
+        "id": {
+            "description": "适配器标识 ID",
+            "type": "string",
+            "hint": "适配器唯一标识符，默认为 yuanbao。多实例部署时需修改为不同值。",
+        },
     },
 )
 class YuanbaoPlatformAdapter(Platform):
@@ -291,18 +330,32 @@ class YuanbaoPlatformAdapter(Platform):
         msg_body: list[dict] | None = None
         extra: dict[str, Any] = {}
 
-        # 1. Try connData / rawData as JSON
+        # 0. Try protobuf InboundMessagePush decoding (primary path)
+        #    This is the main message delivery format — the original OCP gateway
+        #    always tries ``decodeInboundMessage(connData)`` first.
         for key in ("connData", "rawData"):
             data = push.get(key)
             if isinstance(data, bytes) and len(data) > 0:
-                try:
-                    obj = json.loads(data.decode("utf-8"))
-                    if isinstance(obj, dict):
-                        extra.update(obj)
-                        if "msg_body" in obj:
-                            msg_body = obj.get("msg_body")
-                except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
-                    pass
+                decoded = decode_inbound_message(data)
+                if decoded and decoded.get("msg_body"):
+                    extra.update(decoded)
+                    msg_body = decoded["msg_body"]
+                    break
+
+        # 1. Fallback: Try connData / rawData as JSON
+        if not msg_body:
+            for key in ("connData", "rawData"):
+                data = push.get(key)
+                if isinstance(data, bytes) and len(data) > 0:
+                    try:
+                        obj = json.loads(data.decode("utf-8"))
+                        if isinstance(obj, dict):
+                            extra.update(obj)
+                            if "msg_body" in obj:
+                                msg_body = obj.get("msg_body")
+                                break
+                    except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+                        pass
 
         # 2. Try content field
         content = push.get("content")

@@ -101,8 +101,9 @@ def _field_message(field_number: int, msg: bytes) -> bytes:
 class ProtoField:
     number: int
     name: str
-    type: str  # "uint32"|"int32"|"uint64"|"string"|"bool"|"bytes"|"message"|"repeated"
+    type: str  # "uint32"|"int32"|"uint64"|"string"|"bool"|"bytes"|"message"
     message_type: str | None = None
+    repeated: bool = False
 
     @property
     def wire_type(self) -> int:
@@ -199,11 +200,52 @@ FIELDS_MSG_CONTENT: list[ProtoField] = [
     ProtoField(5,  "desc",           "string"),
     ProtoField(6,  "ext",            "string"),
     ProtoField(7,  "sound",          "string"),
-    ProtoField(8,  "imageInfoArray", "message", "ImImageInfoArray"),  # repeated
+    ProtoField(8,  "imageInfoArray", "message", "ImImageInfoArray", repeated=True),
     ProtoField(9,  "index",          "uint32"),
     ProtoField(10, "url",            "string"),
     ProtoField(11, "fileSize",       "uint32"),
     ProtoField(12, "fileName",       "string"),
+]
+
+# MsgBodyElement fields (from biz.json)
+FIELDS_MSG_BODY_ELEMENT: list[ProtoField] = [
+    ProtoField(1, "msgType",    "string"),
+    ProtoField(2, "msgContent", "message", "MsgContent"),
+]
+
+# ImMsgSeq — sequence info for recalled messages
+FIELDS_IM_MSG_SEQ: list[ProtoField] = [
+    ProtoField(1, "msgSeq",  "uint64"),
+    ProtoField(2, "msgId",   "string"),
+]
+
+# LogInfoExt — trace context embedded in business messages
+FIELDS_LOG_INFO_EXT: list[ProtoField] = [
+    ProtoField(1, "traceId", "string"),
+]
+
+# InboundMessagePush — the primary inbound message push proto
+FIELDS_INBOUND_MSG_PUSH: list[ProtoField] = [
+    ProtoField(1,  "callbackCommand",      "string"),
+    ProtoField(2,  "fromAccount",          "string"),
+    ProtoField(3,  "toAccount",            "string"),
+    ProtoField(4,  "senderNickname",       "string"),
+    ProtoField(5,  "groupId",              "string"),
+    ProtoField(6,  "groupCode",            "string"),
+    ProtoField(7,  "groupName",            "string"),
+    ProtoField(8,  "msgSeq",               "uint32"),
+    ProtoField(9,  "msgRandom",            "uint32"),
+    ProtoField(10, "msgTime",              "uint32"),
+    ProtoField(11, "msgKey",               "string"),
+    ProtoField(12, "msgId",                "string"),
+    ProtoField(13, "msgBody",              "message", "MsgBodyElement", repeated=True),
+    ProtoField(14, "cloudCustomData",      "string"),
+    ProtoField(15, "eventTime",            "uint32"),
+    ProtoField(16, "botOwnerId",           "string"),
+    ProtoField(17, "recallMsgSeqList",     "message", "ImMsgSeq",      repeated=True),
+    ProtoField(18, "clawMsgType",          "uint32"),   # EnumCLawMsgType as varint
+    ProtoField(19, "privateFromGroupCode", "string"),
+    ProtoField(20, "logExt",              "message", "LogInfoExt"),
 ]
 
 
@@ -258,18 +300,23 @@ def _encode_submsg(fields: list[ProtoField], values: dict) -> bytes:
 
 def _get_fields(name: str) -> list[ProtoField]:
     _map = {
-        "Head":            FIELDS_HEAD,
-        "ConnMsg":         FIELDS_CONN_MSG,
-        "AuthInfo":        FIELDS_AUTH_INFO,
-        "DeviceInfo":      FIELDS_DEVICE_INFO,
-        "AuthBindReq":     FIELDS_AUTH_BIND_REQ,
-        "AuthBindRsp":     FIELDS_AUTH_BIND_RSP,
-        "PingReq":         [],
-        "PingRsp":         FIELDS_PING_RSP,
-        "KickoutMsg":      FIELDS_KICKOUT_MSG,
-        "PushMsg":         FIELDS_PUSH_MSG,
-        "DirectedPush":    FIELDS_DIRECTED_PUSH,
-        "ImImageInfoArray":FIELDS_IM_IMAGE_INFO,
+        "Head":              FIELDS_HEAD,
+        "ConnMsg":           FIELDS_CONN_MSG,
+        "AuthInfo":          FIELDS_AUTH_INFO,
+        "DeviceInfo":        FIELDS_DEVICE_INFO,
+        "AuthBindReq":       FIELDS_AUTH_BIND_REQ,
+        "AuthBindRsp":       FIELDS_AUTH_BIND_RSP,
+        "PingReq":           [],
+        "PingRsp":           FIELDS_PING_RSP,
+        "KickoutMsg":        FIELDS_KICKOUT_MSG,
+        "PushMsg":           FIELDS_PUSH_MSG,
+        "DirectedPush":      FIELDS_DIRECTED_PUSH,
+        "ImImageInfoArray":  FIELDS_IM_IMAGE_INFO,
+        "MsgContent":        FIELDS_MSG_CONTENT,
+        "MsgBodyElement":    FIELDS_MSG_BODY_ELEMENT,
+        "ImMsgSeq":          FIELDS_IM_MSG_SEQ,
+        "LogInfoExt":        FIELDS_LOG_INFO_EXT,
+        "InboundMessagePush":FIELDS_INBOUND_MSG_PUSH,
     }
     return _map.get(name, [])
 
@@ -341,7 +388,22 @@ def encode_ping_req() -> bytes:
 def _decode_msg(
     fields: list[ProtoField], data: bytes, offset: int = 0
 ) -> tuple[dict, int]:
-    """Decode a protobuf message.  Returns (decoded_dict, new_offset)."""
+    """Decode a protobuf message.  Returns (decoded_dict, new_offset).
+
+    Repeated fields (``ProtoField.repeated == True``) are accumulated into
+    lists.  Other fields are assigned as scalar values.
+    """
+
+    def _assign(result: dict, fname: str, value: Any, f: ProtoField | None) -> None:
+        """Assign a value to a field, accumulating into a list for repeated fields."""
+        if f and f.repeated:
+            if fname in result:
+                result[fname].append(value)
+            else:
+                result[fname] = [value]
+        else:
+            result[fname] = value
+
     result: dict[str, Any] = {}
     field_by_number = {f.number: f for f in fields}
     end = len(data)
@@ -360,29 +422,39 @@ def _decode_msg(
             value, offset = _decode_varint(data, offset)
             if ftype == "bool":
                 value = bool(value)
-            result[fname] = value
+            _assign(result, fname, value, f)
         elif wire_type == _WIRE_LEN:
             length, offset = _decode_varint(data, offset)
             chunk = data[offset : offset + length]
             offset += length
             if ftype == "string":
-                result[fname] = chunk.decode("utf-8", errors="replace")
+                _assign(result, fname, chunk.decode("utf-8", errors="replace"), f)
             elif ftype == "bytes":
-                result[fname] = chunk
+                _assign(result, fname, chunk, f)
             elif ftype == "message":
                 sub_fields = _get_fields(f.message_type) if f and f.message_type else []
                 if sub_fields:
                     sub_result, _ = _decode_msg(sub_fields, chunk)
-                    result[fname] = sub_result
+                    _assign(result, fname, sub_result, f)
                 else:
-                    result[fname] = chunk
+                    _assign(result, fname, chunk, f)
             else:
-                result[fname] = chunk
+                _assign(result, fname, chunk, f)
         elif wire_type == _WIRE_I64:
-            result[fname] = int.from_bytes(data[offset:offset+8], "little", signed=True)
+            _assign(
+                result,
+                fname,
+                int.from_bytes(data[offset : offset + 8], "little", signed=True),
+                f,
+            )
             offset += 8
         elif wire_type == _WIRE_I32:
-            result[fname] = int.from_bytes(data[offset:offset+4], "little", signed=True)
+            _assign(
+                result,
+                fname,
+                int.from_bytes(data[offset : offset + 4], "little", signed=True),
+                f,
+            )
             offset += 4
         else:
             # Skip unknown
@@ -438,6 +510,117 @@ def decode_directed_push(data: bytes) -> dict | None:
         return msg
     except Exception:
         return None
+
+
+# ── InboundMessagePush protobuf decoder ──────────────────────
+
+def _from_proto_msg_content(mc: dict) -> dict:
+    """Convert proto-decoded MsgContent (camelCase keys) → snake_case."""
+    if not mc:
+        return {}
+    _map = {
+        "imageFormat":     "image_format",
+        "imageInfoArray":  "image_info_array",
+        "fileName":        "file_name",
+        "fileSize":        "file_size",
+    }
+    out: dict[str, Any] = {}
+    for k, v in mc.items():
+        out[_map.get(k, k)] = v
+    return out
+
+
+def _decode_proto_msg_body_elements(msg_body_raw: list) -> list[dict]:
+    """Convert proto-decoded msgBody elements to the snake_case format expected
+    by extract_text_from_msg_body / extract_media_from_msg_body / etc.
+
+    Proto-decoded MsgBodyElement shape:
+        { "msgType": "TIMTextElem", "msgContent": { "text": "...", "imageFormat": 0, ... }}
+
+    Output shape:
+        { "msg_type": "TIMTextElem", "msg_content": { "text": "...", "image_format": 0, ... }}
+    """
+    result: list[dict] = []
+    for el in msg_body_raw:
+        if not isinstance(el, dict):
+            continue
+        mc = el.get("msgContent")
+        if isinstance(mc, dict):
+            mc = _from_proto_msg_content(mc)
+        result.append({
+            "msg_type": el.get("msgType", ""),
+            "msg_content": mc if isinstance(mc, dict) else {},
+        })
+    return result
+
+
+def decode_inbound_message(data: bytes) -> dict | None:
+    """Decode an InboundMessagePush protobuf message from raw bytes.
+
+    Returns a dict with the same shape as the JS ``decodeInboundMessage``
+    output, or ``None`` on decode failure.
+
+    Top-level keys are kept in camelCase (matching the extra dict usage in
+    ``_convert_push_to_message``).  The ``msg_body`` list is converted to
+    snake_case ``{msg_type, msg_content}`` format.
+    """
+    try:
+        decoded, _ = _decode_msg(FIELDS_INBOUND_MSG_PUSH, data)
+    except Exception:
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    if not (decoded.get("callbackCommand") or decoded.get("fromAccount")
+            or decoded.get("msgBody") or decoded.get("msgId")):
+        return None
+
+    msg_body_raw = decoded.get("msgBody")
+    msg_body = _decode_proto_msg_body_elements(
+        msg_body_raw if isinstance(msg_body_raw, list) else []
+    ) if msg_body_raw else None
+
+    return {
+        "callback_command":      decoded.get("callbackCommand"),
+        "from_account":          decoded.get("fromAccount"),
+        "to_account":            decoded.get("toAccount"),
+        "sender_nickname":       decoded.get("senderNickname"),
+        "group_id":              decoded.get("groupId"),
+        "group_code":            decoded.get("groupCode"),
+        "group_name":            decoded.get("groupName"),
+        "msg_seq":               decoded.get("msgSeq"),
+        "msg_random":            decoded.get("msgRandom"),
+        "msg_time":              decoded.get("msgTime"),
+        "msg_key":               decoded.get("msgKey"),
+        "msg_id":                decoded.get("msgId"),
+        "msg_body":              msg_body,
+        "cloud_custom_data":     decoded.get("cloudCustomData"),
+        "event_time":            decoded.get("eventTime"),
+        "bot_owner_id":          decoded.get("botOwnerId"),
+        "recall_msg_seq_list":   _clean_recall_list(decoded.get("recallMsgSeqList")),
+        "claw_msg_type":         decoded.get("clawMsgType"),
+        "private_from_group_code": decoded.get("privateFromGroupCode"),
+        "trace_id":              _extract_trace_id(decoded.get("logExt")),
+    }
+
+
+def _clean_recall_list(raw: Any) -> list[dict] | None:
+    """Normalise recallMsgSeqList to a list of dicts or None."""
+    if not raw or not isinstance(raw, list):
+        return None
+    cleaned = []
+    for item in raw:
+        if isinstance(item, dict):
+            cleaned.append(item)
+    return cleaned if cleaned else None
+
+
+def _extract_trace_id(log_ext: Any) -> str | None:
+    """Extract traceId from logExt sub-message."""
+    if isinstance(log_ext, dict):
+        tid = log_ext.get("traceId")
+        if isinstance(tid, str) and tid.strip():
+            return tid.strip()
+    return None
 
 
 # ─────────────────────────────────────────────
@@ -645,12 +828,6 @@ MODULE_CONN_ACCESS = "conn_access"
 BIZ_CMD_SEND_C2C = "send_c2c_message"
 BIZ_CMD_SEND_GROUP = "send_group_message"
 BIZ_MODULE = "yuanbao_openclaw_proxy"
-
-# MsgBodyElement fields (from biz.json)
-FIELDS_MSG_BODY_ELEMENT: list[ProtoField] = [
-    ProtoField(1, "msgType",    "string"),
-    ProtoField(2, "msgContent", "message", "MsgContent"),
-]
 
 # SendC2CMessageReq fields (verified against biz.json)
 FIELDS_SEND_C2C_REQ: list[ProtoField] = [
