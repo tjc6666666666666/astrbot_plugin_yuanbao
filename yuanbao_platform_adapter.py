@@ -81,7 +81,7 @@ _active_adapters: dict[str, "YuanbaoPlatformAdapter"] = {}
         "token": {
             "description": "应用凭据（appKey:appSecret）",
             "type": "string",
-            "hint": "含冒号分隔的 appKey:appSecret 字符串。若已填此字段，则 app_key 和 app_secret 可留空。必填。",
+            "hint": "‼️ 支持两种填写方式：\n  1. 直接填入 appKey:appSecret（例如：abc123:def456）\n  2. 直接粘贴一键安装命令（系统会自动提取 Token）：\n     bash <(curl -fsSL https://static.yuanbao.tencent.com/m/yb-claw/install.sh) --bot-token 你的appKey:appSecret\n若已填此字段，则 app_key 和 app_secret 可留空。必填。",
             "obvious_hint": True,
         },
         "app_key": {
@@ -607,8 +607,11 @@ class YuanbaoPlatformAdapter(Platform):
         """
         Resolve app_key and app_secret from config.
 
-        Supports the colon-separated token format ("appKey:appSecret") as well
-        as explicit app_key / app_secret fields.
+        Supports three input formats:
+        - Direct token: "appKey:appSecret" — split on the first colon
+        - Command with --bot-token: "bash <(curl ...) --bot-token appKey:appSecret"
+          → auto-extracts the token from the --bot-token argument
+        - Explicit app_key + app_secret fields (fallback, takes precedence)
         """
         cfg = self.config
 
@@ -617,6 +620,17 @@ class YuanbaoPlatformAdapter(Platform):
             return
 
         token_str = (cfg.get("token") or "").strip()
+
+        # ── Parse token from a one‑line install command ──
+        #   bash <(curl ...) --bot-token <appKey:appSecret>
+        if token_str and ("bash" in token_str or "curl" in token_str):
+            import re as _re
+            m = _re.search(r'--bot-token\s+(\S+)', token_str)
+            if m:
+                extracted = m.group(1).strip().strip("'\"")
+                logger.info("[yuanbao] 从一键安装命令中提取到 token")
+                token_str = extracted
+
         if token_str:
             colon = token_str.index(":") if ":" in token_str else -1
             if colon > 0:
