@@ -351,6 +351,31 @@ async def upload_raw(
     force_refresh_token: Any = None,
 ) -> dict[str, Any]:
     """Upload raw image bytes to Yuanbao COS, return CDN metadata dict."""
+    # ── Re-encode image via PIL to normalise format ──
+    #   Some upstream services may deliver images with non-standard encoding
+    #   or metadata that yuanbao's backend rejects.  A PIL round-trip through
+    #   PNG produces a clean payload that every backend accepts.
+    if content_type.startswith("image/"):
+        try:
+            from io import BytesIO as _BytesIO
+            from PIL import Image as _PILImage
+
+            orig = _PILImage.open(_BytesIO(data))
+            # Use PNG for lossless re-encoding of any input format
+            buf = _BytesIO()
+            orig.save(buf, format="PNG")
+            data = buf.getvalue()
+            content_type = "image/png"
+            # Keep the original stem but swap extension to .png
+            base = filename.rsplit(".", 1)[0] if "." in filename else filename
+            filename = f"{base}.png"
+            logger.debug(
+                f"[yuanbao] PIL re-encode: {orig.size[0]}x{orig.size[1]} → PNG {len(data)} bytes"
+            )
+        except Exception as exc:
+            logger.warning(f"[yuanbao] PIL re-encode skipped ({exc}), using original bytes")
+    # ── end PIL re-encode ──
+
     async with aiohttp.ClientSession() as session:
         upload_config = await api_get_upload_info(
             token=token, bot_id=bot_id, api_domain=api_domain,

@@ -938,10 +938,15 @@ def encode_send_group_message_req(
     msg_random: int = 0,
     ref_msg_id: str = "",
     msg_seq: int = 0,
+    msg_id_override: str = "",
 ) -> bytes:
-    """Encode a SendGroupMessageReq protobuf message."""
+    """Encode a SendGroupMessageReq protobuf message.
+
+    In the TS version, ``msg_id`` for group messages is set to the inbound
+    message's ``refMsgId`` (passed via ``msg_id_override``), not randomly generated.
+    """
     vals: dict[str, Any] = {
-        "msgId": uuid.uuid4().hex,
+        "msgId": msg_id_override or uuid.uuid4().hex,
         "groupCode": group_code,
         "fromAccount": from_account,
         "random": str(msg_random),

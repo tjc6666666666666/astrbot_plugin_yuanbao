@@ -70,23 +70,59 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
                 "msg_content": {"text": message.get_plain_text() or "(empty)"},
             }]
 
-        envelope = self._build_envelope(msg_body, message)
+        # ── Split mixed text + media into separate messages ──
+        #   The yuanbao backend does not accept TIMImageElem / TIMFileElem
+        #   mixed with TIMTextElem in a single msg_body.  TS version also
+        #   sends text and media as separate WebSocket frames.
+        #   Preserve original sequence: consecutive text elements are grouped
+        #   into one message; each media element is sent as its own message.
+        _MEDIA_TYPES = frozenset({"TIMImageElem", "TIMFileElem"})
+        has_media = any(e.get("msg_type") in _MEDIA_TYPES for e in msg_body)
+        queue = None
 
-        try:
-            await self._send_envelope(envelope)
-        except Exception as exc:
-            logger.error(f"[yuanbao] send failed: {exc}")
+        if has_media:
+            queue: list[list[dict]] = []
+            buf: list[dict] = []
+            for elem in msg_body:
+                if elem.get("msg_type") in _MEDIA_TYPES:
+                    if buf:
+                        queue.append(buf)
+                        buf = []
+                    queue.append([elem])
+                else:
+                    buf.append(elem)
+            if buf:
+                queue.append(buf)
+
+            # If the queue has <=1 batch (all-text or single-media),
+            # skip splitting — fall through to the single-envelope path.
+            if len(queue) <= 1:
+                queue = None
+
+        if queue is not None:
+            for batch in queue:
+                env_batch = self._build_envelope(batch, message)
+                try:
+                    await self._send_envelope(env_batch)
+                except Exception as exc:
+                    logger.error(f"[yuanbao] split-send failed: {exc}")
+        else:
+            envelope = self._build_envelope(msg_body, message)
             try:
-                fallback = {
-                    **envelope,
-                    "msg_body": [{
-                        "msg_type": "TIMTextElem",
-                        "msg_content": {"text": message.get_plain_text() or "..."},
-                    }],
-                }
-                await self._send_envelope(fallback)
-            except Exception as exc2:
-                logger.error(f"[yuanbao] fallback send also failed: {exc2}")
+                await self._send_envelope(envelope)
+            except Exception as exc:
+                logger.error(f"[yuanbao] send failed: {exc}")
+                try:
+                    fallback = {
+                        **envelope,
+                        "msg_body": [{
+                            "msg_type": "TIMTextElem",
+                            "msg_content": {"text": message.get_plain_text() or "..."},
+                        }],
+                    }
+                    await self._send_envelope(fallback)
+                except Exception as exc2:
+                    logger.error(f"[yuanbao] fallback send also failed: {exc2}")
 
         await super().send(message)
 
@@ -146,10 +182,34 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
                         body.append({"msg_type": "TIMTextElem", "msg_content": {"text": f"[文件: {file_name}]"}})
 
             elif isinstance(comp, Record):
-                body.append({"msg_type": "TIMSoundElem", "msg_content": {"sound": comp.file or ""}})
+                record_url = self._extract_media_url(comp)
+                if record_url:
+                    uploaded = await self._upload_media(record_url, "audio")
+                    if uploaded:
+                        body.append({"msg_type": "TIMFileElem", "msg_content": {"url": uploaded["url"], "file_name": uploaded.get("filename", "audio"), "file_size": uploaded.get("size", 0), "uuid": uploaded["uuid"]}})
+                        continue
+                local_fp = self._extract_media_local_path(comp)
+                if local_fp:
+                    uploaded = await self._upload_media(local_fp, "audio")
+                    if uploaded:
+                        body.append({"msg_type": "TIMFileElem", "msg_content": {"url": uploaded["url"], "file_name": uploaded.get("filename", "audio"), "file_size": uploaded.get("size", 0), "uuid": uploaded["uuid"]}})
+                        continue
+                body.append({"msg_type": "TIMTextElem", "msg_content": {"text": "[语音]"}})
 
             elif isinstance(comp, Video):
-                body.append({"msg_type": "TIMVideoFileElem", "msg_content": {"data": comp.file or ""}})
+                video_url = self._extract_media_url(comp)
+                if video_url:
+                    uploaded = await self._upload_media(video_url, "video")
+                    if uploaded:
+                        body.append({"msg_type": "TIMFileElem", "msg_content": {"url": uploaded["url"], "file_name": uploaded.get("filename", "video"), "file_size": uploaded.get("size", 0), "uuid": uploaded["uuid"]}})
+                        continue
+                local_fp = self._extract_media_local_path(comp)
+                if local_fp:
+                    uploaded = await self._upload_media(local_fp, "video")
+                    if uploaded:
+                        body.append({"msg_type": "TIMFileElem", "msg_content": {"url": uploaded["url"], "file_name": uploaded.get("filename", "video"), "file_size": uploaded.get("size", 0), "uuid": uploaded["uuid"]}})
+                        continue
+                body.append({"msg_type": "TIMTextElem", "msg_content": {"text": "[视频]"}})
 
             elif At is not None and isinstance(comp, At):
                 qq = comp.qq
@@ -178,7 +238,7 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
     # ── COS upload helpers  ───────────────────────
 
     async def _upload_image(self, image_url: str) -> dict | None:
-        """Download → COS upload → TIMImageElem msg_body dict.  Returns None on failure."""
+        """Download → COS upload → TIMImageElem.  Returns None on failure."""
         try:
             from .yuanbao_media import download_and_upload
 
@@ -283,7 +343,9 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
             else:
                 group_code = (msg_obj.session_id or "")
 
-        to_account = sender_id if is_group else (msg_obj.session_id or "")
+        # TS transport NEVER passes to_account for group messages.
+        # Including it may cause the backend to reject the SendGroupMessageReq.
+        to_account = "" if is_group else (msg_obj.session_id or "")
         env: dict = {
             "to_account": to_account,
             "msg_body": msg_body,
@@ -293,6 +355,12 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
         if group_code:
             env["group_code"] = group_code
         env["_is_group"] = is_group or bool(group_code)
+
+        # Pass the inbound message ID so _send_envelope can use it as msgId
+        # for group messages (matching TS behaviour where msg_id = refMsgId).
+        inbound_msg_id = getattr(msg_obj, "message_id", None) or ""
+        if inbound_msg_id:
+            env["inbound_msg_id"] = str(inbound_msg_id)
 
         # Attach ref_msg_id for group reply quoting ONLY when AstrBot's
         # ResultDecorateStage has inserted a Reply component into the chain
@@ -339,6 +407,8 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
         is_group = envelope.get("_is_group", False)
         msg_random = envelope.get("msg_random", _random.randint(0, 2**32 - 1))
         ref_msg_id = envelope.get("ref_msg_id", "")
+        # TS uses the inbound message's msgId as the group message's msgId
+        inbound_msg_id = envelope.get("inbound_msg_id", "")
 
         if is_group or group_code:
             biz_data = codec.encode_send_group_message_req(
@@ -348,6 +418,8 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
                 to_account=to_account,
                 msg_random=msg_random,
                 ref_msg_id=str(ref_msg_id) if ref_msg_id else "",
+                msg_seq=0,
+                msg_id_override=inbound_msg_id or "",
             )
             cmd = codec.BIZ_CMD_SEND_GROUP
         else:
@@ -370,6 +442,75 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
         )
 
     # ── helpers  ──────────────────────────────────
+
+    @staticmethod
+    def _extract_media_url(comp) -> str | None:
+        """Extract an HTTP(S) URL from any media component (Record, Video, Image)."""
+        for attr in ("file", "url", "path"):
+            val = getattr(comp, attr, None)
+            if val:
+                val = str(val).strip()
+                if val.startswith("http://") or val.startswith("https://"):
+                    return val
+        return None
+
+    @staticmethod
+    def _extract_media_local_path(comp) -> str | None:
+        """Extract a local file path from any media component (file:// or bare path)."""
+        for attr in ("file", "url", "path", "file_"):
+            val = getattr(comp, attr, None)
+            if not val:
+                continue
+            val = str(val).strip()
+            if val.startswith("file:///"):
+                p = val[8:]
+                if os.path.exists(p):
+                    return p
+            elif val.startswith("file://"):
+                p = val[7:]
+                if os.path.exists(p):
+                    return p
+            elif not val.startswith("http://") and not val.startswith("https://"):
+                if os.path.exists(val):
+                    return val
+        return None
+
+    async def _upload_media(self, url_or_path: str, media_kind: str = "file") -> dict | None:
+        """Upload a media file (video/audio) to COS.  Accepts HTTP URL or local path."""
+        import mimetypes
+        try:
+            from .yuanbao_media import download_and_upload, upload_raw
+        except ImportError:
+            return None
+
+        refresh_cb = self._make_token_refresh_cb()
+        token = self._token
+        bot_id = self.from_account or ""
+        api_domain = self._api_domain
+
+        if url_or_path.startswith("http://") or url_or_path.startswith("https://"):
+            result = await download_and_upload(
+                image_url=url_or_path,
+                token=token, bot_id=bot_id, api_domain=api_domain,
+                route_env=self._route_env,
+                force_refresh_token=refresh_cb,
+            )
+        else:
+            if not os.path.exists(url_or_path):
+                return None
+            with open(url_or_path, "rb") as f:
+                data = f.read()
+            filename = os.path.basename(url_or_path)
+            content_type, _ = mimetypes.guess_type(url_or_path)
+            if not content_type:
+                content_type = "application/octet-stream"
+            result = await upload_raw(
+                data=data, filename=filename, content_type=content_type,
+                token=token, bot_id=bot_id, api_domain=api_domain,
+                route_env=self._route_env,
+                force_refresh_token=refresh_cb,
+            )
+        return result
 
     async def _upload_image_file(self, filepath: str) -> dict | None:
         """Read local file → upload to COS → TIMImageElem.  Returns None on failure."""
