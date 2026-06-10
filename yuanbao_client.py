@@ -19,7 +19,6 @@ Usage::
 from __future__ import annotations
 
 import asyncio
-import logging
 import platform
 import uuid
 from dataclasses import dataclass, field
@@ -30,9 +29,9 @@ import websockets
 from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
-from . import yuanbao_codec as codec
+from astrbot.api import logger
 
-logger = logging.getLogger(__name__)
+from . import yuanbao_codec as codec
 
 # ─────────────────────────────────────────────
 #  Constants (mirror openclaw-plugin-yuanbao)
@@ -279,15 +278,13 @@ class YuanbaoWsClient:
                     elif isinstance(raw, str):
                         await self._on_message(raw.encode("utf-8"))
                 except Exception:
-                    import traceback
-                    traceback.print_exc()
+                    logger.error("[yuanbao] _recv_loop message error", exc_info=True)
         except ConnectionClosed as exc:
             code = exc.code or 1000
             reason = exc.reason or ""
             await self._on_close(code, reason)
         except Exception as exc:
-            import traceback
-            traceback.print_exc()
+            logger.error(f"[yuanbao] _recv_loop unexpected error: {exc}", exc_info=True)
             try:
                 await self._on_close(1006, f"_recv_loop unexpected error: {exc}")
             except Exception:
@@ -442,8 +439,7 @@ class YuanbaoWsClient:
             try:
                 await self.on_close(code, reason)
             except Exception:
-                import traceback
-                traceback.print_exc()
+                logger.error(f"[yuanbao] on_close callback error (code={code})", exc_info=True)
         if self._disposed:
             return
         if code in NO_RECONNECT_CLOSE_CODES:

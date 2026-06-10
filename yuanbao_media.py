@@ -35,6 +35,32 @@ DOWNLOAD_TIMEOUT = aiohttp.ClientTimeout(
 DOWNLOAD_MAX_CHUNK_BYTES = 65536  # 64 KiB per chunk
 STREAM_RATE_LIMIT = 5 * 1024 * 1024  # 5 MB/s per-stream throttle hint
 
+# ── shared HTTP session ──────────────────────────
+#   Reusing a single ClientSession across calls amortises TCP / TLS
+#   handshake costs for frequent uploads & downloads.
+_shared_session: aiohttp.ClientSession | None = None
+_shared_session_lock = asyncio.Lock()
+
+
+async def _get_shared_session() -> aiohttp.ClientSession:
+    """Return a lazily-created module-level ``ClientSession``."""
+    global _shared_session
+    if _shared_session is None or _shared_session.closed:
+        async with _shared_session_lock:
+            if _shared_session is None or _shared_session.closed:
+                _shared_session = aiohttp.ClientSession(
+                    timeout=DOWNLOAD_TIMEOUT,
+                )
+    return _shared_session
+
+
+async def close_media_session() -> None:
+    """Close the shared session (call during adapter shutdown)."""
+    global _shared_session
+    if _shared_session and not _shared_session.closed:
+        await _shared_session.close()
+        _shared_session = None
+
 # ── helpers  ─────────────────────────────────────
 
 def parse_image_size(data: bytes) -> dict | None:
@@ -81,6 +107,28 @@ def parse_image_size(data: bytes) -> dict | None:
 
 def _sha1_hex(data: bytes) -> str:
     return hashlib.sha1(data).hexdigest()
+
+
+def _pil_reencode(data: bytes, filename: str) -> tuple[bytes, str, str]:
+    """Re-encode image bytes via PIL to PNG (lossless).
+
+    Returns ``(new_data, new_filename, "image/png")``.
+    Runs on a worker thread via ``asyncio.to_thread`` so that CPU-heavy
+    decode/encode never stalls the event loop.
+    """
+    from io import BytesIO as _BytesIO
+    from PIL import Image as _PILImage
+
+    orig = _PILImage.open(_BytesIO(data))
+    buf = _BytesIO()
+    orig.save(buf, format="PNG")
+    new_data = buf.getvalue()
+    base = filename.rsplit(".", 1)[0] if "." in filename else filename
+    logger.debug(
+        "[yuanbao] PIL re-encode: %dx%d → PNG %d bytes",
+        orig.size[0], orig.size[1], len(new_data),
+    )
+    return new_data, f"{base}.png", "image/png"
 
 
 def _hmac_sha1(key: bytes, msg: bytes) -> bytes:
@@ -352,50 +400,37 @@ async def upload_raw(
 ) -> dict[str, Any]:
     """Upload raw image bytes to Yuanbao COS, return CDN metadata dict."""
     # ── Re-encode image via PIL to normalise format ──
-    #   Some upstream services may deliver images with non-standard encoding
-    #   or metadata that yuanbao's backend rejects.  A PIL round-trip through
-    #   PNG produces a clean payload that every backend accepts.
+    #   Offloaded to a thread so that PIL decode/encode (CPU-heavy) does not
+    #   block the asyncio event loop.
     if content_type.startswith("image/"):
         try:
-            from io import BytesIO as _BytesIO
-            from PIL import Image as _PILImage
-
-            orig = _PILImage.open(_BytesIO(data))
-            # Use PNG for lossless re-encoding of any input format
-            buf = _BytesIO()
-            orig.save(buf, format="PNG")
-            data = buf.getvalue()
-            content_type = "image/png"
-            # Keep the original stem but swap extension to .png
-            base = filename.rsplit(".", 1)[0] if "." in filename else filename
-            filename = f"{base}.png"
-            logger.debug(
-                f"[yuanbao] PIL re-encode: {orig.size[0]}x{orig.size[1]} → PNG {len(data)} bytes"
+            data, filename, content_type = await asyncio.to_thread(
+                _pil_reencode, data, filename
             )
         except Exception as exc:
             logger.warning(f"[yuanbao] PIL re-encode skipped ({exc}), using original bytes")
     # ── end PIL re-encode ──
 
-    async with aiohttp.ClientSession() as session:
-        upload_config = await api_get_upload_info(
-            token=token, bot_id=bot_id, api_domain=api_domain,
-            file_name=filename, session=session, route_env=route_env,
-            force_refresh_token=force_refresh_token,
-        )
-        is_img = content_type.startswith("image/")
-        cos_url = await upload_to_cos(
-            upload_config=upload_config, data=data, content_type=content_type,
-            session=session, is_image=is_img,
-        )
-        size = len(data)
-        img_uuid = hashlib.md5(data).hexdigest()
-        img_size = parse_image_size(data) if is_img else None
-        return {
-            "url": upload_config.get("resourceUrl", cos_url),
-            "filename": filename, "size": size, "uuid": img_uuid,
-            "width": img_size["width"] if img_size else 0,
-            "height": img_size["height"] if img_size else 0,
-        }
+    session = await _get_shared_session()
+    upload_config = await api_get_upload_info(
+        token=token, bot_id=bot_id, api_domain=api_domain,
+        file_name=filename, session=session, route_env=route_env,
+        force_refresh_token=force_refresh_token,
+    )
+    is_img = content_type.startswith("image/")
+    cos_url = await upload_to_cos(
+        upload_config=upload_config, data=data, content_type=content_type,
+        session=session, is_image=is_img,
+    )
+    size = len(data)
+    img_uuid = hashlib.md5(data).hexdigest()
+    img_size = parse_image_size(data) if is_img else None
+    return {
+        "url": upload_config.get("resourceUrl", cos_url),
+        "filename": filename, "size": size, "uuid": img_uuid,
+        "width": img_size["width"] if img_size else 0,
+        "height": img_size["height"] if img_size else 0,
+    }
 
 
 async def download_and_upload(
@@ -414,36 +449,36 @@ async def download_and_upload(
     """
     max_bytes = media_max_mb * 1024 * 1024
 
-    async with aiohttp.ClientSession() as session:
-        # ── Download image with chunked streaming + early size abort ──
-        async with session.get(image_url, timeout=DOWNLOAD_TIMEOUT) as resp:
-            if not resp.ok:
-                raise RuntimeError(f"download image failed: HTTP {resp.status} — {image_url[:120]}")
+    session = await _get_shared_session()
+    # ── Download image with chunked streaming + early size abort ──
+    async with session.get(image_url, timeout=DOWNLOAD_TIMEOUT) as resp:
+        if not resp.ok:
+            raise RuntimeError(f"download image failed: HTTP {resp.status} — {image_url[:120]}")
 
-            content_type = resp.headers.get("Content-Type", "image/png").split(";")[0].strip()
+        content_type = resp.headers.get("Content-Type", "image/png").split(";")[0].strip()
 
-            # Quick reject via Content-Length header
-            content_length = resp.content_length
-            if content_length is not None and content_length > max_bytes:
+        # Quick reject via Content-Length header
+        content_length = resp.content_length
+        if content_length is not None and content_length > max_bytes:
+            raise RuntimeError(
+                f"image too large: {(content_length / 1024 / 1024):.1f} MB > {media_max_mb} MB"
+            )
+
+        # Stream chunk-by-chunk, abort early if exceeding limit
+        img_data = bytearray()
+        async for chunk in resp.content.iter_chunked(DOWNLOAD_MAX_CHUNK_BYTES):
+            img_data.extend(chunk)
+            if len(img_data) > max_bytes:
                 raise RuntimeError(
-                    f"image too large: {(content_length / 1024 / 1024):.1f} MB > {media_max_mb} MB"
+                    f"image too large during stream: {(len(img_data) / 1024 / 1024):.1f} MB > {media_max_mb} MB"
                 )
+        img_data = bytes(img_data)
 
-            # Stream chunk-by-chunk, abort early if exceeding limit
-            img_data = bytearray()
-            async for chunk in resp.content.iter_chunked(DOWNLOAD_MAX_CHUNK_BYTES):
-                img_data.extend(chunk)
-                if len(img_data) > max_bytes:
-                    raise RuntimeError(
-                        f"image too large during stream: {(len(img_data) / 1024 / 1024):.1f} MB > {media_max_mb} MB"
-                    )
-            img_data = bytes(img_data)
-
-        parsed = urllib.parse.urlparse(image_url)
-        filename = os.path.basename(parsed.path) or "image.png"
-        if "." not in filename.rsplit("/", 1)[-1]:
-            ext_map = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp"}
-            filename = filename + ext_map.get(content_type, ".png")
+    parsed = urllib.parse.urlparse(image_url)
+    filename = os.path.basename(parsed.path) or "image.png"
+    if "." not in filename.rsplit("/", 1)[-1]:
+        ext_map = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp"}
+        filename = filename + ext_map.get(content_type, ".png")
 
     # Reuse the core upload
     return await upload_raw(
@@ -627,49 +662,49 @@ async def download_media(
             return {"filename": filename, "data": data, "mime_type": mime_type}
         raise RuntimeError(f"local file not found: {url}")
 
-    async with aiohttp.ClientSession() as session:
-        # ── Resolve resourceId if present ──
-        fetch_url = url
-        parsed = urllib.parse.urlparse(url)
-        qs = urllib.parse.parse_qs(parsed.query)
-        resource_id = qs.get("resourceId", [None])[0]
-        if resource_id and token and bot_id:
-            try:
-                fetch_url = await api_get_download_url(
-                    token=token, bot_id=bot_id, api_domain=api_domain,
-                    resource_id=resource_id, session=session,
-                    route_env=route_env, force_refresh_token=force_refresh_token,
-                )
-            except Exception as exc:
-                # Fall back to original URL if resourceId resolution fails
-                logger.warning(f"[yuanbao] resourceId download resolution failed, using raw URL: {exc}")
+    session = await _get_shared_session()
+    # ── Resolve resourceId if present ──
+    fetch_url = url
+    parsed = urllib.parse.urlparse(url)
+    qs = urllib.parse.parse_qs(parsed.query)
+    resource_id = qs.get("resourceId", [None])[0]
+    if resource_id and token and bot_id:
+        try:
+            fetch_url = await api_get_download_url(
+                token=token, bot_id=bot_id, api_domain=api_domain,
+                resource_id=resource_id, session=session,
+                route_env=route_env, force_refresh_token=force_refresh_token,
+            )
+        except Exception as exc:
+            # Fall back to original URL if resourceId resolution fails
+            logger.warning(f"[yuanbao] resourceId download resolution failed, using raw URL: {exc}")
 
-        # ── Download with chunked streaming + early size abort ──
-        async with session.get(fetch_url, timeout=DOWNLOAD_TIMEOUT) as resp:
-            if not resp.ok:
-                raise RuntimeError(f"download media failed: HTTP {resp.status} — {fetch_url[:120]}")
+    # ── Download with chunked streaming + early size abort ──
+    async with session.get(fetch_url, timeout=DOWNLOAD_TIMEOUT) as resp:
+        if not resp.ok:
+            raise RuntimeError(f"download media failed: HTTP {resp.status} — {fetch_url[:120]}")
 
-            content_type = resp.headers.get("Content-Type", "").split(";")[0].strip()
-            filename = _infer_filename(resp, fetch_url, content_type)
-            mime_type = content_type or _guess_mime_type(filename)
+        content_type = resp.headers.get("Content-Type", "").split(";")[0].strip()
+        filename = _infer_filename(resp, fetch_url, content_type)
+        mime_type = content_type or _guess_mime_type(filename)
 
-            # Quick reject via Content-Length header
-            content_length = resp.content_length
-            if content_length is not None and content_length > max_bytes:
+        # Quick reject via Content-Length header
+        content_length = resp.content_length
+        if content_length is not None and content_length > max_bytes:
+            raise RuntimeError(
+                f"media too large: {(content_length / 1024 / 1024):.1f} MB > {media_max_mb} MB"
+            )
+
+        # Stream chunk-by-chunk and abort early if the limit is exceeded.
+        # Prevents OOM when a malicious/slow server omits Content-Length
+        # or sends an unexpectedly large body.
+        data = bytearray()
+        async for chunk in resp.content.iter_chunked(DOWNLOAD_MAX_CHUNK_BYTES):
+            data.extend(chunk)
+            if len(data) > max_bytes:
                 raise RuntimeError(
-                    f"media too large: {(content_length / 1024 / 1024):.1f} MB > {media_max_mb} MB"
+                    f"media too large during stream: {(len(data) / 1024 / 1024):.1f} MB > {media_max_mb} MB"
                 )
-
-            # Stream chunk-by-chunk and abort early if the limit is exceeded.
-            # Prevents OOM when a malicious/slow server omits Content-Length
-            # or sends an unexpectedly large body.
-            data = bytearray()
-            async for chunk in resp.content.iter_chunked(DOWNLOAD_MAX_CHUNK_BYTES):
-                data.extend(chunk)
-                if len(data) > max_bytes:
-                    raise RuntimeError(
-                        f"media too large during stream: {(len(data) / 1024 / 1024):.1f} MB > {media_max_mb} MB"
-                    )
 
     return {"filename": filename, "data": bytes(data), "mime_type": mime_type}
 

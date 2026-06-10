@@ -327,6 +327,12 @@ class YuanbaoPlatformAdapter(Platform):
             _active_adapters.pop(self.config.get("id", "yuanbao"), None)
         if self.client:
             await self.client.disconnect()
+        # Clean up the shared media HTTP session
+        try:
+            from .yuanbao_media import close_media_session
+            await close_media_session()
+        except Exception:
+            pass
 
     # ── WS callbacks ──────────────────────────────────
 
