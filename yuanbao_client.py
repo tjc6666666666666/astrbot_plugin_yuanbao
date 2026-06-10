@@ -146,7 +146,7 @@ class YuanbaoWsClient:
             try:
                 await self.on_state_change(new)
             except Exception:
-                pass
+                logger.debug("[yuanbao] on_state_change callback error", exc_info=True)
 
     async def _do_connect(self, *, is_reconnect: bool = False) -> bool:
         """Attempt one connection.  Returns ``True`` on success, ``False`` on failure.
@@ -265,6 +265,7 @@ class YuanbaoWsClient:
             await self._ws.send(data)
             return True
         except Exception:
+            logger.debug("[yuanbao] _send_binary failed", exc_info=True)
             return False
 
     async def _recv_loop(self) -> None:
@@ -288,7 +289,7 @@ class YuanbaoWsClient:
             try:
                 await self._on_close(1006, f"_recv_loop unexpected error: {exc}")
             except Exception:
-                pass
+                logger.debug("[yuanbao] _on_close inner error", exc_info=True)
 
     async def _on_message(self, data: bytes) -> None:
         conn_msg = codec.decode_conn_msg(data)
@@ -401,7 +402,7 @@ class YuanbaoWsClient:
                 try:
                     await self.on_dispatch(event)
                 except Exception:
-                    pass
+                    logger.debug("[yuanbao] on_dispatch (PushMsg) callback error", exc_info=True)
             return
 
         # Try DirectedPush
@@ -418,7 +419,7 @@ class YuanbaoWsClient:
                 try:
                     await self.on_dispatch(event)
                 except Exception:
-                    pass
+                    logger.debug("[yuanbao] on_dispatch (DirectedPush) callback error", exc_info=True)
             return
 
         # Unrecognised push — pass raw data
@@ -431,7 +432,7 @@ class YuanbaoWsClient:
                     "rawData": data,
                 })
             except Exception:
-                pass
+                logger.debug("[yuanbao] on_dispatch (raw) callback error", exc_info=True)
 
     async def _on_close(self, code: int, reason: str) -> None:
         self._stop_heartbeat()
@@ -479,7 +480,7 @@ class YuanbaoWsClient:
             try:
                 await self._send_ping()
             except Exception:
-                pass
+                logger.debug("[yuanbao] heartbeat ping failed", exc_info=True)
             await asyncio.sleep(self._heartbeat_interval_s - 1)
 
     # ── reconnect ──────────────────────────
@@ -547,6 +548,7 @@ class YuanbaoWsClient:
             else:
                 await self._set_state(ClientState.DISCONNECTED)
         except Exception:
+            logger.debug("[yuanbao] auth-failed refresh callback error", exc_info=True)
             if not self._disposed:
                 await self._schedule_reconnect()
 
@@ -556,7 +558,7 @@ class YuanbaoWsClient:
             try:
                 await self._ws.close()
             except Exception:
-                pass
+                logger.debug("[yuanbao] ws.close() error", exc_info=True)
             self._ws = None
 
     async def _cleanup(self) -> None:
