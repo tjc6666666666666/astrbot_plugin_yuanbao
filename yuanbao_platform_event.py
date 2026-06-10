@@ -9,8 +9,11 @@ Yuanbao COS before being referenced in TIMImageElem / TIMFileElem.
 
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import os
+import random
 import uuid
 from typing import TYPE_CHECKING
 
@@ -389,7 +392,6 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
         return None
 
     async def _send_envelope(self, envelope: dict) -> None:
-        import random as _random
         from . import yuanbao_codec as codec
         from .yuanbao_client import ClientState
 
@@ -405,7 +407,7 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
         from_account = envelope.get("from_account", self.from_account)
         group_code = envelope.get("group_code", "")
         is_group = envelope.get("_is_group", False)
-        msg_random = envelope.get("msg_random", _random.randint(0, 2**32 - 1))
+        msg_random = envelope.get("msg_random", random.randint(0, 2**32 - 1))
         ref_msg_id = envelope.get("ref_msg_id", "")
         # TS uses the inbound message's msgId as the group message's msgId
         inbound_msg_id = envelope.get("inbound_msg_id", "")
@@ -477,7 +479,6 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
 
     async def _upload_media(self, url_or_path: str, media_kind: str = "file") -> dict | None:
         """Upload a media file (video/audio) to COS.  Accepts HTTP URL or local path."""
-        import mimetypes
         try:
             from .yuanbao_media import download_and_upload, upload_raw
         except ImportError:
@@ -514,7 +515,6 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
 
     async def _upload_image_file(self, filepath: str) -> dict | None:
         """Read local file → upload to COS → TIMImageElem.  Returns None on failure."""
-        import mimetypes
         try:
             with open(filepath, "rb") as f:
                 data = f.read()
@@ -528,7 +528,6 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
 
     async def _upload_file_file(self, filepath: str, file_name: str = "") -> dict | None:
         """Read local file → upload to COS → TIMFileElem.  Returns None on failure."""
-        import mimetypes
         try:
             with open(filepath, "rb") as f:
                 data = f.read()
@@ -632,18 +631,17 @@ class YuanbaoPlatformEvent(AstrMessageEvent):
         """Decode a base64 image from Image.file (data: or base64://)."""
         raw = getattr(comp, "file", "") or getattr(comp, "url", "") or ""
         raw = str(raw).strip()
-        import base64 as _b64
         try:
             if raw.startswith("data:"):
                 # data:image/png;base64,iVBORw0...
                 header, _, b64 = raw.partition(",")
                 content_type = header.split(";")[0].replace("data:", "", 1) or "image/png"
-                return {"data": _b64.b64decode(b64), "content_type": content_type}
+                return {"data": base64.b64decode(b64), "content_type": content_type}
             if raw.startswith("base64://"):
                 b64 = raw[len("base64://"):]
                 # Guess type from mime hints or default to png
                 content_type = "image/png"
-                return {"data": _b64.b64decode(b64), "content_type": content_type}
+                return {"data": base64.b64decode(b64), "content_type": content_type}
         except Exception:
             pass
         return None

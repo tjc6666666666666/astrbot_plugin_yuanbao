@@ -19,8 +19,11 @@ Configuration (stored in AstrBot's platform config):
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import mimetypes
 import os
+import random
 import uuid
 from typing import Any
 
@@ -257,8 +260,6 @@ class YuanbaoPlatformAdapter(Platform):
                 "msg_content": {"text": message_chain.get_plain_text() or "(empty)"},
             }]
 
-        import random as _random
-
         # ── Split mixed text + media into separate messages ──
         #   Preserve original sequence order.
         _MEDIA_TYPES = frozenset({"TIMImageElem", "TIMFileElem"})
@@ -290,7 +291,7 @@ class YuanbaoPlatformAdapter(Platform):
                     "msg_body": batch,
                     "from_account": self._from_account,
                     "group_code": group_code,
-                    "msg_random": _random.randint(0, 2**32 - 1),
+                    "msg_random": random.randint(0, 2**32 - 1),
                 }
                 try:
                     await self.send_raw(batch_env, is_group=is_group)
@@ -302,7 +303,7 @@ class YuanbaoPlatformAdapter(Platform):
                 "msg_body": msg_body,
                 "from_account": self._from_account,
                 "group_code": group_code,
-                "msg_random": _random.randint(0, 2**32 - 1),
+                "msg_random": random.randint(0, 2**32 - 1),
             }
             try:
                 await self.send_raw(envelope, is_group=is_group)
@@ -802,8 +803,6 @@ class YuanbaoPlatformAdapter(Platform):
         """Build a Yuanbao msg_body list from a MessageChain.  Handles COS upload
         for Image / File components.  Mirrors ``YuanbaoPlatformEvent._build_msg_body``.
         """
-        import json as _json
-        import os as _os
 
         body: list[dict] = []
         for comp in message.chain:
@@ -841,7 +840,7 @@ class YuanbaoPlatformAdapter(Platform):
 
             elif isinstance(comp, File):
                 file_url = getattr(comp, "file_", None) or getattr(comp, "url", None) or ""
-                file_name = comp.name or _os.path.basename(str(file_url)) or "file"
+                file_name = comp.name or os.path.basename(str(file_url)) or "file"
                 file_url = str(file_url).strip()
                 if file_url and (file_url.startswith("http://") or file_url.startswith("https://")):
                     uploaded = await self._upload_file(file_url, file_name)
@@ -901,7 +900,7 @@ class YuanbaoPlatformAdapter(Platform):
                     body.append({
                         "msg_type": "TIMCustomElem",
                         "msg_content": {
-                            "data": _json.dumps({
+                            "data": json.dumps({
                                 "elem_type": 1002,
                                 "text": text_at,
                                 "user_id": str(qq),
@@ -949,14 +948,13 @@ class YuanbaoPlatformAdapter(Platform):
 
     async def _upload_image_data(self, data: bytes, content_type: str) -> dict | None:
         """Upload raw image bytes to COS → TIMImageElem."""
-        import uuid as _uuid
         try:
             from .yuanbao_media import upload_raw
             refresh_cb = self._make_media_token_refresh_cb()
             ext_map = {"image/jpeg": ".jpg", "image/png": ".png",
                        "image/gif": ".gif", "image/webp": ".webp"}
             ext = ext_map.get(content_type, ".png")
-            filename = f"img_{_uuid.uuid4().hex[:8]}{ext}"
+            filename = f"img_{uuid.uuid4().hex[:8]}{ext}"
             result = await upload_raw(
                 data=data, filename=filename, content_type=content_type,
                 token=self._token, bot_id=self._from_account or "",
@@ -982,7 +980,6 @@ class YuanbaoPlatformAdapter(Platform):
 
     async def _upload_image_file(self, filepath: str) -> dict | None:
         """Read local image file → upload to COS → TIMFileElem."""
-        import mimetypes
         try:
             with open(filepath, "rb") as f:
                 data = f.read()
@@ -1008,17 +1005,16 @@ class YuanbaoPlatformAdapter(Platform):
     @staticmethod
     def _extract_image_base64(comp: Image) -> dict | None:
         """Decode a base64 image from Image.file (data: or base64://)."""
-        import base64 as _b64
         raw = getattr(comp, "file", "") or getattr(comp, "url", "") or ""
         raw = str(raw).strip()
         try:
             if raw.startswith("data:"):
                 header, _, b64 = raw.partition(",")
                 content_type = header.split(";")[0].replace("data:", "", 1) or "image/png"
-                return {"data": _b64.b64decode(b64), "content_type": content_type}
+                return {"data": base64.b64decode(b64), "content_type": content_type}
             if raw.startswith("base64://"):
                 b64 = raw[len("base64://"):]
-                return {"data": _b64.b64decode(b64), "content_type": "image/png"}
+                return {"data": base64.b64decode(b64), "content_type": "image/png"}
         except Exception:
             pass
         return None
@@ -1026,7 +1022,6 @@ class YuanbaoPlatformAdapter(Platform):
     @staticmethod
     def _extract_image_local_path(comp: Image) -> str | None:
         """Extract a local file path from an Image component (file:// or bare path)."""
-        import os as _os
         candidates = [
             getattr(comp, "file", None),
             getattr(comp, "url", None),
@@ -1039,14 +1034,14 @@ class YuanbaoPlatformAdapter(Platform):
             c = str(c).strip()
             if c.startswith("file:///"):
                 p = c[8:]
-                if _os.path.exists(p):
+                if os.path.exists(p):
                     return p
             elif c.startswith("file://"):
                 p = c[7:]
-                if _os.path.exists(p):
+                if os.path.exists(p):
                     return p
             elif not c.startswith("http://") and not c.startswith("https://"):
-                if _os.path.exists(c):
+                if os.path.exists(c):
                     return c
         return None
 
@@ -1064,7 +1059,6 @@ class YuanbaoPlatformAdapter(Platform):
     @staticmethod
     def _extract_media_local_path(comp) -> str | None:
         """Extract a local file path from any media component (file:// or bare path)."""
-        import os as _os
         candidates = [
             getattr(comp, "file", None),
             getattr(comp, "url", None),
@@ -1077,22 +1071,20 @@ class YuanbaoPlatformAdapter(Platform):
             c = str(c).strip()
             if c.startswith("file:///"):
                 p = c[8:]
-                if _os.path.exists(p):
+                if os.path.exists(p):
                     return p
             elif c.startswith("file://"):
                 p = c[7:]
-                if _os.path.exists(p):
+                if os.path.exists(p):
                     return p
             elif not c.startswith("http://") and not c.startswith("https://"):
-                if _os.path.exists(c):
+                if os.path.exists(c):
                     return c
         return None
 
     async def _upload_media(self, url_or_path: str, media_kind: str = "file") -> dict | None:
         """Upload a media file (video/audio) to COS.  Accepts HTTP URL or local path.
         Returns ``{url, uuid, size, filename}`` or None."""
-        import mimetypes
-        import os as _os
         try:
             from .yuanbao_media import download_and_upload, upload_raw
         except ImportError:
@@ -1113,11 +1105,11 @@ class YuanbaoPlatformAdapter(Platform):
             )
         else:
             # Local file — read & upload
-            if not _os.path.exists(url_or_path):
+            if not os.path.exists(url_or_path):
                 return None
             with open(url_or_path, "rb") as f:
                 data = f.read()
-            filename = _os.path.basename(url_or_path)
+            filename = os.path.basename(url_or_path)
             content_type, _ = mimetypes.guess_type(url_or_path)
             if not content_type:
                 content_type = "application/octet-stream"
@@ -1155,7 +1147,6 @@ class YuanbaoPlatformAdapter(Platform):
             return None
 
     async def _upload_file_file(self, filepath: str, file_name: str = "") -> dict | None:
-        import mimetypes
         try:
             with open(filepath, "rb") as f:
                 data = f.read()
@@ -1188,18 +1179,17 @@ class YuanbaoPlatformAdapter(Platform):
     @staticmethod
     def _extract_local_path_for_file(file_url: str) -> str | None:
         """Extract a local file path from a file URL or path string."""
-        import os as _os
         c = str(file_url).strip()
         if c.startswith("file:///"):
             p = c[8:]
-            if _os.path.exists(p):
+            if os.path.exists(p):
                 return p
         elif c.startswith("file://"):
             p = c[7:]
-            if _os.path.exists(p):
+            if os.path.exists(p):
                 return p
         elif not c.startswith("http://") and not c.startswith("https://"):
-            if _os.path.exists(c):
+            if os.path.exists(c):
                 return c
         return None
 
@@ -1207,7 +1197,6 @@ class YuanbaoPlatformAdapter(Platform):
 
     async def send_raw(self, envelope: dict, *, is_group: bool = False) -> None:
         """Encode and send a raw msg_body envelope over the WebSocket."""
-        import random as _random
 
         if self.client is None or self.client.state is not ClientState.CONNECTED:
             raise RuntimeError("[yuanbao] WebSocket not connected, cannot send")
@@ -1216,7 +1205,7 @@ class YuanbaoPlatformAdapter(Platform):
         to_account = envelope.get("to_account", "")
         from_account = envelope.get("from_account", self._from_account)
         group_code = envelope.get("group_code", "")
-        msg_random = envelope.get("msg_random", _random.randint(0, 2**32 - 1))
+        msg_random = envelope.get("msg_random", random.randint(0, 2**32 - 1))
         ref_msg_id = envelope.get("ref_msg_id", "")
         # TS uses the inbound message's msgId as the group message's msgId
         inbound_msg_id = envelope.get("inbound_msg_id", "")
